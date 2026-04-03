@@ -4,12 +4,14 @@ import datetime
 import logging
 import re
 from decimal import Decimal
+from enum import Enum
 from importlib.util import find_spec
 from typing import Any
 from fnmatch import fnmatch
 from pathlib import Path
 
 from pyspark.sql import Column
+from pyspark.sql.types import StructType
 
 # Import spark connect column if spark session is created using spark connect
 try:
@@ -21,6 +23,7 @@ import pyspark.sql.functions as F
 from databricks.sdk import WorkspaceClient
 from databricks.labs.blueprint.limiter import rate_limited
 from databricks.labs.dqx.errors import InvalidParameterError
+from databricks.labs.dqx.table_manager import SparkTableDataProvider
 from databricks.sdk.errors import NotFound
 
 logger = logging.getLogger(__name__)
@@ -123,7 +126,31 @@ def is_simple_column_expression(col_name: str) -> bool:
     return not bool(INVALID_COLUMN_NAME_PATTERN.search(col_name))
 
 
-def normalize_bound_args(val: Any) -> Any:
+def _normalize_leaf_value(val: Any, allow_simple_expressions_only: bool) -> Any:
+    """Normalize a leaf (non-collection) value. Called by normalize_bound_args."""
+    if isinstance(val, (str, int, float, bool)):
+        return val
+
+    if isinstance(val, (datetime.date, datetime.datetime)):
+        return str(val)
+
+    if isinstance(val, Decimal):
+        return {"__decimal__": str(val)}
+
+    column_types: tuple[type[Any], ...] = (Column, ConnectColumn) if ConnectColumn is not None else (Column,)
+    if isinstance(val, column_types):
+        return get_column_name_or_alias(val, allow_simple_expressions_only=allow_simple_expressions_only)
+
+    if isinstance(val, StructType):
+        return val.simpleString()
+
+    if isinstance(val, Enum):
+        return normalize_bound_args(val.value, allow_simple_expressions_only)
+
+    raise TypeError(f"Unsupported type for normalization: {type(val).__name__}")
+
+
+def normalize_bound_args(val: Any, allow_simple_expressions_only: bool = True) -> Any:
     """
     Normalize a value or collection of values for consistent processing.
 
@@ -135,6 +162,10 @@ def normalize_bound_args(val: Any) -> Any:
 
     Args:
         val: Value or collection of values to normalize.
+        allow_simple_expressions_only: If True (default), Column values must be simple expressions
+            (e.g. F.col("name")). If False, complex expressions (e.g. F.try_element_at(...)) are
+            allowed and serialized as their string representation. Use False when serializing
+            for fingerprinting/metadata only, where round-trip reconstruction is not required.
 
     Returns:
         Normalized value or collection.
@@ -145,29 +176,13 @@ def normalize_bound_args(val: Any) -> Any:
     if val is None:
         return None
 
-    if isinstance(val, (list, tuple, set)):
-        normalized = [normalize_bound_args(v) for v in val]
-        return normalized
+    if isinstance(val, (list, tuple, set, frozenset)):
+        return [normalize_bound_args(v, allow_simple_expressions_only) for v in val]
 
-    if isinstance(val, (str, int, float, bool)):
-        return val
+    if isinstance(val, dict):
+        return {k: normalize_bound_args(v, allow_simple_expressions_only) for k, v in val.items()}
 
-    if isinstance(val, (datetime.date, datetime.datetime)):
-        return str(val)
-
-    if isinstance(val, Decimal):
-        # Use a special format to preserve Decimal type information for round-trip
-        return {"__decimal__": str(val)}
-
-    if ConnectColumn is not None:
-        column_types: tuple[type[Any], ...] = (Column, ConnectColumn)
-    else:
-        column_types = (Column,)
-
-    if isinstance(val, column_types):
-        col_str = get_column_name_or_alias(val, allow_simple_expressions_only=True)
-        return col_str
-    raise TypeError(f"Unsupported type for normalization: {type(val).__name__}")
+    return _normalize_leaf_value(val, allow_simple_expressions_only)
 
 
 def normalize_col_str(col_str: str) -> str:
@@ -461,6 +476,56 @@ def to_lowercase(col_expr: Column, is_array: bool = False) -> Column:
     if is_array:
         return F.transform(col_expr, F.lower)
     return F.lower(col_expr)
+
+
+def table_exists(spark: Any, table: str) -> bool:
+    """
+    Check if a table exists (Unity Catalog compatible).
+
+    Uses the catalog API only (no Spark job). Requires Spark 3.4+ for
+    fully qualified table names (e.g. catalog.schema.table).
+
+    Args:
+        spark: SparkSession instance.
+        table: Fully qualified table name (e.g. "catalog.schema.table").
+
+    Returns:
+        True if the table exists, False otherwise.
+    """
+    return spark.catalog.tableExists(table)
+
+
+def get_table_primary_keys(table: str, spark: Any) -> set[str]:
+    """
+    Retrieve primary key columns from Unity Catalog table metadata.
+
+    Uses SparkTableDataProvider (table_manager) to read table properties and
+    parses the primary key constraint into a set of column names.
+
+    Args:
+        table: Fully qualified table name (e.g., "catalog.schema.table")
+        spark: SparkSession instance
+
+    Returns:
+        Set of column names that are primary keys. Returns empty set if:
+        - Table doesn't exist
+        - No primary key is defined
+        - Metadata is not accessible
+
+    Examples:
+        >>> pk_cols = get_table_primary_keys("main.default.users", spark)
+        >>> if "user_id" in pk_cols:
+        ...     print("user_id is a primary key")
+    """
+    try:
+        provider = SparkTableDataProvider(spark)
+        pk_str = provider.get_existing_primary_key(table)
+        if pk_str is None:
+            return set()
+        return {c.strip() for c in pk_str.split(",")}
+    except Exception:
+        # Silently handle errors (table not found, permissions, etc.)
+        return set()
 
 
 def missing_required_packages(packages: list[str]) -> bool:

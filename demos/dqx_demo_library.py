@@ -474,10 +474,12 @@ display(spark.table(f"{demo_catalog_name}.{demo_schema_name}.dqx_quarantine"))
 
 # COMMAND ----------
 
-# end-to-end quality checking flow
+# End-to-end quality checking flow
+# By default, apply_checks_and_save_in_table method apply checks to the entire input table.
+# Incremental processing is supported using streaming with the AvailableNow trigger for batch-style execution, along with checkpointing to ensure consistency across runs.
 dq_engine.apply_checks_by_metadata_and_save_in_table(
     input_config=InputConfig("/databricks-datasets/delta-sharing/samples/nyctaxi_2019"),
-    checks=checks,
+    checks=checks,  # or provide checks_location and run_config_name to auto-load from checks storage
     output_config=OutputConfig(f"{demo_catalog_name}.{demo_schema_name}.dqx_e2e_output", mode="overwrite"),
     quarantine_config=OutputConfig(f"{demo_catalog_name}.{demo_schema_name}.dqx_e2e_quarantine", mode="overwrite")
 )
@@ -695,7 +697,7 @@ display(valid_and_quarantine_df)
 # MAGIC ### Extended Aggregate Functions for Data Quality Checks
 # MAGIC
 # MAGIC DQX now supports 20 curated aggregate functions for advanced data quality monitoring:
-# MAGIC - **Statistical functions**: `stddev`, `variance`, `median`, `mode`, `skewness`, `kurtosis` for anomaly detection
+# MAGIC - **Statistical functions**: `stddev`, `variance`, `median`, `mode`, `skewness`, `kurtosis` for outlier detection
 # MAGIC - **Percentile functions**: `percentile`, `approx_percentile` for SLA monitoring
 # MAGIC - **Cardinality functions**: `count_distinct`, `approx_count_distinct` (uses HyperLogLog++)
 # MAGIC - **Any Databricks built-in aggregate**: Supported with runtime validation
@@ -703,7 +705,7 @@ display(valid_and_quarantine_df)
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC #### Example 1: Statistical Functions - Anomaly Detection with Standard Deviation
+# MAGIC #### Example 1: Statistical Functions with Standard Deviation
 # MAGIC
 # MAGIC Detect unusual variance in sensor readings per machine. High standard deviation indicates unstable sensors that may need calibration.
 
