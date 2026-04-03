@@ -25,6 +25,21 @@ import type {
 import * as axios from "axios";
 import type { AxiosError, AxiosRequestConfig, AxiosResponse } from "axios";
 
+export type AnomalyConfigColumns = string[] | null;
+
+export type AnomalyConfigSegmentBy = string[] | null;
+
+export type AnomalyConfigModelName = string | null;
+
+export type AnomalyConfigRegistryTable = string | null;
+
+export interface AnomalyConfig {
+  columns?: AnomalyConfigColumns;
+  segment_by?: AnomalyConfigSegmentBy;
+  model_name?: AnomalyConfigModelName;
+  registry_table?: AnomalyConfigRegistryTable;
+}
+
 export interface CatalogsOut {
   catalogs: string[];
 }
@@ -141,6 +156,7 @@ export interface ExtraParams {
   user_metadata?: ExtraParamsUserMetadata;
   run_time_overwrite?: ExtraParamsRunTimeOverwrite;
   run_id_overwrite?: ExtraParamsRunIdOverwrite;
+  suppress_skipped?: boolean;
 }
 
 /**
@@ -222,6 +238,10 @@ export type ProfilerConfigSampleSeed = number | null;
 
 export type ProfilerConfigFilter = string | null;
 
+export type ProfilerConfigMaxNullRatio = number | null;
+
+export type ProfilerConfigMaxEmptyRatio = number | null;
+
 export interface ProfilerConfig {
   summary_stats_file?: string;
   sample_fraction?: number;
@@ -229,6 +249,8 @@ export interface ProfilerConfig {
   limit?: number;
   filter?: ProfilerConfigFilter;
   llm_primary_key_detection?: boolean;
+  max_null_ratio?: ProfilerConfigMaxNullRatio;
+  max_empty_ratio?: ProfilerConfigMaxEmptyRatio;
 }
 
 export interface RunChecksJobOut {
@@ -258,6 +280,8 @@ export type RunConfigReferenceTables = { [key: string]: InputConfig };
 
 export type RunConfigCustomCheckFunctions = { [key: string]: string };
 
+export type RunConfigAnomalyConfig = AnomalyConfig | null;
+
 export type RunConfigLakebaseInstanceName = string | null;
 
 export type RunConfigLakebaseClientId = string | null;
@@ -276,6 +300,7 @@ export interface RunConfig {
   warehouse_id?: RunConfigWarehouseId;
   reference_tables?: RunConfigReferenceTables;
   custom_check_functions?: RunConfigCustomCheckFunctions;
+  anomaly_config?: RunConfigAnomalyConfig;
   lakebase_instance_name?: RunConfigLakebaseInstanceName;
   lakebase_client_id?: RunConfigLakebaseClientId;
   lakebase_port?: RunConfigLakebasePort;
@@ -426,6 +451,13 @@ export type WorkspaceConfigInputE2eOverrideClustersAnyOf = {
 export type WorkspaceConfigInputE2eOverrideClusters =
   WorkspaceConfigInputE2eOverrideClustersAnyOf | null;
 
+export type WorkspaceConfigInputAnomalyOverrideClustersAnyOf = {
+  [key: string]: string;
+};
+
+export type WorkspaceConfigInputAnomalyOverrideClusters =
+  WorkspaceConfigInputAnomalyOverrideClustersAnyOf | null;
+
 export type WorkspaceConfigInputProfilerSparkConfAnyOf = {
   [key: string]: string;
 };
@@ -445,6 +477,13 @@ export type WorkspaceConfigInputE2eSparkConfAnyOf = { [key: string]: string };
 export type WorkspaceConfigInputE2eSparkConf =
   WorkspaceConfigInputE2eSparkConfAnyOf | null;
 
+export type WorkspaceConfigInputAnomalySparkConfAnyOf = {
+  [key: string]: string;
+};
+
+export type WorkspaceConfigInputAnomalySparkConf =
+  WorkspaceConfigInputAnomalySparkConfAnyOf | null;
+
 export type WorkspaceConfigInputCustomMetrics = string[] | null;
 
 export interface WorkspaceConfigInput {
@@ -456,9 +495,11 @@ export interface WorkspaceConfigInput {
   profiler_override_clusters?: WorkspaceConfigInputProfilerOverrideClusters;
   quality_checker_override_clusters?: WorkspaceConfigInputQualityCheckerOverrideClusters;
   e2e_override_clusters?: WorkspaceConfigInputE2eOverrideClusters;
+  anomaly_override_clusters?: WorkspaceConfigInputAnomalyOverrideClusters;
   profiler_spark_conf?: WorkspaceConfigInputProfilerSparkConf;
   quality_checker_spark_conf?: WorkspaceConfigInputQualityCheckerSparkConf;
   e2e_spark_conf?: WorkspaceConfigInputE2eSparkConf;
+  anomaly_spark_conf?: WorkspaceConfigInputAnomalySparkConf;
   profiler_max_parallelism?: number;
   quality_checker_max_parallelism?: number;
   custom_metrics?: WorkspaceConfigInputCustomMetrics;
@@ -490,6 +531,13 @@ export type WorkspaceConfigOutputE2eOverrideClustersAnyOf = {
 export type WorkspaceConfigOutputE2eOverrideClusters =
   WorkspaceConfigOutputE2eOverrideClustersAnyOf | null;
 
+export type WorkspaceConfigOutputAnomalyOverrideClustersAnyOf = {
+  [key: string]: string;
+};
+
+export type WorkspaceConfigOutputAnomalyOverrideClusters =
+  WorkspaceConfigOutputAnomalyOverrideClustersAnyOf | null;
+
 export type WorkspaceConfigOutputProfilerSparkConfAnyOf = {
   [key: string]: string;
 };
@@ -509,6 +557,13 @@ export type WorkspaceConfigOutputE2eSparkConfAnyOf = { [key: string]: string };
 export type WorkspaceConfigOutputE2eSparkConf =
   WorkspaceConfigOutputE2eSparkConfAnyOf | null;
 
+export type WorkspaceConfigOutputAnomalySparkConfAnyOf = {
+  [key: string]: string;
+};
+
+export type WorkspaceConfigOutputAnomalySparkConf =
+  WorkspaceConfigOutputAnomalySparkConfAnyOf | null;
+
 export type WorkspaceConfigOutputCustomMetrics = string[] | null;
 
 export interface WorkspaceConfigOutput {
@@ -520,9 +575,11 @@ export interface WorkspaceConfigOutput {
   profiler_override_clusters?: WorkspaceConfigOutputProfilerOverrideClusters;
   quality_checker_override_clusters?: WorkspaceConfigOutputQualityCheckerOverrideClusters;
   e2e_override_clusters?: WorkspaceConfigOutputE2eOverrideClusters;
+  anomaly_override_clusters?: WorkspaceConfigOutputAnomalyOverrideClusters;
   profiler_spark_conf?: WorkspaceConfigOutputProfilerSparkConf;
   quality_checker_spark_conf?: WorkspaceConfigOutputQualityCheckerSparkConf;
   e2e_spark_conf?: WorkspaceConfigOutputE2eSparkConf;
+  anomaly_spark_conf?: WorkspaceConfigOutputAnomalySparkConf;
   profiler_max_parallelism?: number;
   quality_checker_max_parallelism?: number;
   custom_metrics?: WorkspaceConfigOutputCustomMetrics;
@@ -1169,7 +1226,7 @@ export const getGetSettingsQueryKey = () => {
 
 export const getGetSettingsQueryOptions = <
   TData = Awaited<ReturnType<typeof getSettings>>,
-  TError = AxiosError<HTTPValidationError>,
+  TError = AxiosError<unknown>,
 >(options?: {
   query?: Partial<
     UseQueryOptions<Awaited<ReturnType<typeof getSettings>>, TError, TData>
@@ -1194,11 +1251,11 @@ export const getGetSettingsQueryOptions = <
 export type GetSettingsQueryResult = NonNullable<
   Awaited<ReturnType<typeof getSettings>>
 >;
-export type GetSettingsQueryError = AxiosError<HTTPValidationError>;
+export type GetSettingsQueryError = AxiosError<unknown>;
 
 export function useGetSettings<
   TData = Awaited<ReturnType<typeof getSettings>>,
-  TError = AxiosError<HTTPValidationError>,
+  TError = AxiosError<unknown>,
 >(
   options: {
     query: Partial<
@@ -1220,7 +1277,7 @@ export function useGetSettings<
 };
 export function useGetSettings<
   TData = Awaited<ReturnType<typeof getSettings>>,
-  TError = AxiosError<HTTPValidationError>,
+  TError = AxiosError<unknown>,
 >(
   options?: {
     query?: Partial<
@@ -1242,7 +1299,7 @@ export function useGetSettings<
 };
 export function useGetSettings<
   TData = Awaited<ReturnType<typeof getSettings>>,
-  TError = AxiosError<HTTPValidationError>,
+  TError = AxiosError<unknown>,
 >(
   options?: {
     query?: Partial<
@@ -1260,7 +1317,7 @@ export function useGetSettings<
 
 export function useGetSettings<
   TData = Awaited<ReturnType<typeof getSettings>>,
-  TError = AxiosError<HTTPValidationError>,
+  TError = AxiosError<unknown>,
 >(
   options?: {
     query?: Partial<
@@ -1286,7 +1343,7 @@ export function useGetSettings<
 
 export const getGetSettingsSuspenseQueryOptions = <
   TData = Awaited<ReturnType<typeof getSettings>>,
-  TError = AxiosError<HTTPValidationError>,
+  TError = AxiosError<unknown>,
 >(options?: {
   query?: Partial<
     UseSuspenseQueryOptions<
@@ -1315,11 +1372,11 @@ export const getGetSettingsSuspenseQueryOptions = <
 export type GetSettingsSuspenseQueryResult = NonNullable<
   Awaited<ReturnType<typeof getSettings>>
 >;
-export type GetSettingsSuspenseQueryError = AxiosError<HTTPValidationError>;
+export type GetSettingsSuspenseQueryError = AxiosError<unknown>;
 
 export function useGetSettingsSuspense<
   TData = Awaited<ReturnType<typeof getSettings>>,
-  TError = AxiosError<HTTPValidationError>,
+  TError = AxiosError<unknown>,
 >(
   options: {
     query: Partial<
@@ -1337,7 +1394,7 @@ export function useGetSettingsSuspense<
 };
 export function useGetSettingsSuspense<
   TData = Awaited<ReturnType<typeof getSettings>>,
-  TError = AxiosError<HTTPValidationError>,
+  TError = AxiosError<unknown>,
 >(
   options?: {
     query?: Partial<
@@ -1355,7 +1412,7 @@ export function useGetSettingsSuspense<
 };
 export function useGetSettingsSuspense<
   TData = Awaited<ReturnType<typeof getSettings>>,
-  TError = AxiosError<HTTPValidationError>,
+  TError = AxiosError<unknown>,
 >(
   options?: {
     query?: Partial<
@@ -1377,7 +1434,7 @@ export function useGetSettingsSuspense<
 
 export function useGetSettingsSuspense<
   TData = Awaited<ReturnType<typeof getSettings>>,
-  TError = AxiosError<HTTPValidationError>,
+  TError = AxiosError<unknown>,
 >(
   options?: {
     query?: Partial<

@@ -2,5 +2,5 @@ command:
   [
     "bash",
     "-lc",
-    "./.venv/bin/pip install --upgrade /app/python/source_code/*.whl && uvicorn databricks_labs_dqx_app.backend.app:app --workers 2",
+    "./.venv/bin/pip install --force-reinstall --no-deps /app/python/source_code/*.whl && uvicorn databricks_labs_dqx_app.backend.app:app --workers 2",
   ]

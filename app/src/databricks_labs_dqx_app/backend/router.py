@@ -1,12 +1,10 @@
 import re
 import json
-from itertools import islice
 from pathlib import Path
 from typing import Annotated
 
 import yaml
 from databricks.labs.blueprint.installation import Installation
-from databricks.labs.blueprint.installer import InstallState
 from databricks.labs.dqx.profiler.generator import DQGenerator
 from databricks.labs.dqx.config import (
     InputConfig,
@@ -59,10 +57,10 @@ api = APIRouter(prefix=conf.api_prefix)
 _UNICODE_ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
 
 
-def get_install_folder(ws: WorkspaceClient, path: str | None, user_name: str | None = None) -> str:
+def get_install_folder(ws: WorkspaceClient, path: str | None) -> str:
     folder = path
     if not folder:
-        settings = SettingsManager(ws, user_name=user_name).get_settings()
+        settings = SettingsManager(ws).get_settings()
         folder = settings.install_folder
         logger.info(f"Using install folder from settings: {folder}")
     else:
@@ -82,34 +80,28 @@ def me(obo_ws: Annotated[WorkspaceClient, Depends(get_obo_ws)]):
 
 @api.get("/settings", response_model=InstallationSettings, operation_id="get_settings")
 def get_settings(
-    obo_ws: Annotated[WorkspaceClient, Depends(get_obo_ws)],
     app_ws: Annotated[WorkspaceClient, Depends(get_app_ws)],
 ):
-    user_name = obo_ws.current_user.me().user_name
-    return SettingsManager(app_ws, user_name=user_name).get_settings()
+    return SettingsManager(app_ws).get_settings()
 
 
 @api.post("/settings", response_model=InstallationSettings, operation_id="save_settings")
 def save_settings(
     settings: InstallationSettings,
-    obo_ws: Annotated[WorkspaceClient, Depends(get_obo_ws)],
     app_ws: Annotated[WorkspaceClient, Depends(get_app_ws)],
 ):
-    user_name = obo_ws.current_user.me().user_name
     try:
-        return SettingsManager(app_ws, user_name=user_name).save_settings(settings)
+        return SettingsManager(app_ws).save_settings(settings)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @api.get("/config", response_model=ConfigOut, operation_id="config")
 def get_config(
-    obo_ws: Annotated[WorkspaceClient, Depends(get_obo_ws)],
     app_ws: Annotated[WorkspaceClient, Depends(get_app_ws)],
     path: str | None = Query(None, description="Path to the configuration folder"),
 ) -> ConfigOut:
-    user_name = obo_ws.current_user.me().user_name
-    install_folder = get_install_folder(app_ws, path, user_name=user_name)
+    install_folder = get_install_folder(app_ws, path)
     logger.info(f"Loading config from install folder: {install_folder}")
     serializer = ConfigSerializer(app_ws)
     try:
@@ -130,12 +122,10 @@ def get_config(
 @api.post("/config", response_model=ConfigOut, operation_id="save_config")
 def save_config(
     body: ConfigIn,
-    obo_ws: Annotated[WorkspaceClient, Depends(get_obo_ws)],
     app_ws: Annotated[WorkspaceClient, Depends(get_app_ws)],
     path: str | None = Query(None, description="Path to the configuration folder"),
 ) -> ConfigOut:
-    user_name = obo_ws.current_user.me().user_name
-    install_folder = get_install_folder(app_ws, path, user_name=user_name)
+    install_folder = get_install_folder(app_ws, path)
     serializer = ConfigSerializer(app_ws)
     serializer.save_config(body.config, install_folder=install_folder)
     return ConfigOut(config=serializer.load_config(install_folder=install_folder))
@@ -144,12 +134,10 @@ def save_config(
 @api.get("/config/run/{name}", response_model=RunConfigOut, operation_id="get_run_config")
 def get_run_config(
     name: str,
-    obo_ws: Annotated[WorkspaceClient, Depends(get_obo_ws)],
     app_ws: Annotated[WorkspaceClient, Depends(get_app_ws)],
     path: str | None = Query(None, description="Path to the configuration folder"),
 ) -> RunConfigOut:
-    user_name = obo_ws.current_user.me().user_name
-    install_folder = get_install_folder(app_ws, path, user_name=user_name)
+    install_folder = get_install_folder(app_ws, path)
     serializer = ConfigSerializer(app_ws)
     try:
         return RunConfigOut(config=serializer.load_run_config(run_config_name=name, install_folder=install_folder))
@@ -160,14 +148,19 @@ def get_run_config(
 @api.post("/config/run", response_model=RunConfigOut, operation_id="save_run_config")
 def save_run_config(
     body: RunConfigIn,
-    obo_ws: Annotated[WorkspaceClient, Depends(get_obo_ws)],
     app_ws: Annotated[WorkspaceClient, Depends(get_app_ws)],
     path: str | None = Query(None, description="Path to the configuration folder"),
 ) -> RunConfigOut:
-    user_name = obo_ws.current_user.me().user_name
-    install_folder = get_install_folder(app_ws, path, user_name=user_name)
+    install_folder = get_install_folder(app_ws, path)
     serializer = ConfigSerializer(app_ws)
-    serializer.save_run_config(body.config, install_folder=install_folder)
+    try:
+        serializer.save_run_config(body.config, install_folder=install_folder)
+    except (ResourceDoesNotExist, PermissionDenied):
+        # Config or folder doesn't exist yet — bootstrap via SettingsManager
+        settings_mgr = SettingsManager(app_ws)
+        settings_mgr.save_settings(InstallationSettings(install_folder=install_folder))
+        # Now retry the save
+        serializer.save_run_config(body.config, install_folder=install_folder)
     return RunConfigOut(
         config=serializer.load_run_config(run_config_name=body.config.name, install_folder=install_folder)
     )
@@ -176,12 +169,10 @@ def save_run_config(
 @api.delete("/config/run/{name}", response_model=ConfigOut, operation_id="delete_run_config")
 def delete_run_config(
     name: str,
-    obo_ws: Annotated[WorkspaceClient, Depends(get_obo_ws)],
     app_ws: Annotated[WorkspaceClient, Depends(get_app_ws)],
     path: str | None = Query(None, description="Path to the configuration folder"),
 ) -> ConfigOut:
-    user_name = obo_ws.current_user.me().user_name
-    install_folder = get_install_folder(app_ws, path, user_name=user_name)
+    install_folder = get_install_folder(app_ws, path)
     serializer = ConfigSerializer(app_ws)
 
     try:
@@ -202,13 +193,11 @@ def delete_run_config(
 @api.get("/config/run/{name}/checks", response_model=ChecksOut, operation_id="get_run_checks")
 def get_run_checks(
     name: str,
-    obo_ws: Annotated[WorkspaceClient, Depends(get_obo_ws)],
     app_ws: Annotated[WorkspaceClient, Depends(get_app_ws)],
     engine: Annotated[DQEngine, Depends(get_engine)],
     path: str | None = Query(None, description="Path to the configuration folder"),
 ) -> ChecksOut:
-    user_name = obo_ws.current_user.me().user_name
-    install_folder = get_install_folder(app_ws, path, user_name=user_name)
+    install_folder = get_install_folder(app_ws, path)
     serializer = ConfigSerializer(app_ws)
     try:
         run_config = serializer.load_run_config(run_config_name=name, install_folder=install_folder)
@@ -232,13 +221,11 @@ def get_run_checks(
 def save_run_checks(
     name: str,
     body: ChecksIn,
-    obo_ws: Annotated[WorkspaceClient, Depends(get_obo_ws)],
     app_ws: Annotated[WorkspaceClient, Depends(get_app_ws)],
     engine: Annotated[DQEngine, Depends(get_engine)],
     path: str | None = Query(None, description="Path to the configuration folder"),
 ) -> ChecksOut:
-    user_name = obo_ws.current_user.me().user_name
-    install_folder = get_install_folder(app_ws, path, user_name=user_name)
+    install_folder = get_install_folder(app_ws, path)
     serializer = ConfigSerializer(app_ws)
     try:
         run_config = serializer.load_run_config(run_config_name=name, install_folder=install_folder)
@@ -253,13 +240,10 @@ def save_run_checks(
 @api.post("/config/run/{name}/execute", response_model=ExecuteRunOut, operation_id="execute_run_config")
 def execute_run_config(
     name: str,
-    obo_ws: Annotated[WorkspaceClient, Depends(get_obo_ws)],
     app_ws: Annotated[WorkspaceClient, Depends(get_app_ws)],
-    spark: Annotated[SparkSession, Depends(get_app_spark)],
     path: str | None = Query(None, description="Path to the configuration folder"),
 ) -> ExecuteRunOut:
-    user_name = obo_ws.current_user.me().user_name
-    install_folder = get_install_folder(app_ws, path, user_name=user_name)
+    install_folder = get_install_folder(app_ws, path)
     serializer = ConfigSerializer(app_ws)
     try:
         run_config = serializer.load_run_config(run_config_name=name, install_folder=install_folder)
@@ -276,13 +260,10 @@ def execute_run_config(
 
 @api.post("/config/runs/execute", response_model=ExecuteRunsOut, operation_id="execute_all_run_configs")
 def execute_all_run_configs(
-    obo_ws: Annotated[WorkspaceClient, Depends(get_obo_ws)],
     app_ws: Annotated[WorkspaceClient, Depends(get_app_ws)],
-    spark: Annotated[SparkSession, Depends(get_app_spark)],
     path: str | None = Query(None, description="Path to the configuration folder"),
 ) -> ExecuteRunsOut:
-    user_name = obo_ws.current_user.me().user_name
-    install_folder = get_install_folder(app_ws, path, user_name=user_name)
+    install_folder = get_install_folder(app_ws, path)
     serializer = ConfigSerializer(app_ws)
     try:
         config = serializer.load_config(install_folder=install_folder)
@@ -587,74 +568,6 @@ def _submit_dqx_run(
     run_url = f"{host}/#job/runs/{int(run_id)}"
     return int(run_id), run_url
 
-
-def _resolve_dashboard_ids(
-    ws: WorkspaceClient,
-    install_folder: str,
-) -> list[str]:
-    ids: list[str] = []
-    seen: set[str] = set()
-
-    installation_candidates = [
-        Installation(ws, "dqx", install_folder=install_folder),
-    ]
-    try:
-        installation_candidates.append(Installation.current(ws, "dqx"))
-    except Exception:
-        pass
-    try:
-        installation_candidates.append(Installation.current(ws, "dqx", assume_user=False))
-    except Exception:
-        pass
-    try:
-        installation_candidates.append(Installation.assume_user_home(ws, "dqx"))
-    except Exception:
-        pass
-    try:
-        installation_candidates.append(Installation.assume_global(ws, "dqx"))
-    except Exception:
-        pass
-
-    for installation in installation_candidates:
-        try:
-            install_state = InstallState.from_installation(installation)
-            for dashboard_id in install_state.dashboards.values():
-                if not dashboard_id:
-                    continue
-                dashboard_id = str(dashboard_id)
-                if dashboard_id in seen:
-                    continue
-                # Keep only dashboards that still exist.
-                ws.lakeview.get(dashboard_id)
-                seen.add(dashboard_id)
-                ids.append(dashboard_id)
-        except Exception:
-            continue
-
-    # Fallback: discover directly from Lakeview dashboards if install state is unavailable.
-    if not ids:
-        preferred: list[str] = []
-        any_active: list[str] = []
-        try:
-            for dashboard in islice(ws.lakeview.list(), 500):
-                dashboard_id = str(getattr(dashboard, "dashboard_id", "") or "").strip()
-                if not dashboard_id or dashboard_id in seen:
-                    continue
-                lifecycle_state = str(getattr(dashboard, "lifecycle_state", "") or "")
-                if "TRASHED" in lifecycle_state.upper():
-                    continue
-                display_name = str(getattr(dashboard, "display_name", "") or "")
-                lowered = display_name.lower()
-                if "dqx" in lowered or "data quality" in lowered:
-                    preferred.append(dashboard_id)
-                any_active.append(dashboard_id)
-                seen.add(dashboard_id)
-        except Exception:
-            pass
-
-        ids.extend(preferred or any_active[:1])
-
-    return ids
 
 
 def _extract_workspace_id(host: str) -> str:

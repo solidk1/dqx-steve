@@ -151,16 +151,3 @@ def setup_logger(
 logger = setup_logger(app_name, level=logging.INFO)
 
 
-def get_logger(name: str | None = None) -> logging.Logger:
-    """
-    Get a logger instance.
-
-    Args:
-        name: Logger name. If None, returns the default app logger.
-
-    Returns:
-        Logger instance.
-    """
-    if name is None:
-        return logger
-    return setup_logger(name)
