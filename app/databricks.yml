@@ -7,7 +7,7 @@ sync:
 
 artifacts:
   default:
-    build: uv run apx build
+    build: .venv/bin/python -m apx build && uv build --wheel --out-dir ".build" ".."
 
 resources:
   apps:

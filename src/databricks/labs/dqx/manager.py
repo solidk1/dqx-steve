@@ -1,6 +1,8 @@
 import logging
+import re
+import unicodedata
 from datetime import datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cached_property
 
 import pyspark.sql.functions as F
@@ -51,6 +53,119 @@ class DQRuleManager:
     ref_dfs: dict[str, DataFrame] | None = None
 
     @cached_property
+    def _canonical_to_actual_columns(self) -> dict[str, str]:
+        mapping: dict[str, str] = {}
+        for col in self.df.columns:
+            for key in self._candidate_keys(col):
+                if key and key not in mapping:
+                    mapping[key] = col
+        return mapping
+
+    @staticmethod
+    def _canonical(value: str) -> str:
+        return unicodedata.normalize("NFKC", value).replace("\u200b", "").replace("\ufeff", "").strip().casefold()
+
+    @staticmethod
+    def _dequote_once(value: str) -> str:
+        if not isinstance(value, str):
+            return value
+        trimmed = value.strip()
+        if len(trimmed) >= 2 and trimmed[0] == trimmed[-1] and trimmed[0] in ('"', "'", "`"):
+            return trimmed[1:-1].strip()
+        return trimmed
+
+    def _candidate_keys(self, value: str) -> list[str]:
+        if not isinstance(value, str):
+            return []
+        keys: list[str] = []
+        current = value
+        for _ in range(3):
+            key = self._canonical(current)
+            if key and key not in keys:
+                keys.append(key)
+            deq = self._dequote_once(current)
+            if deq == current:
+                break
+            current = deq
+        return keys
+
+    @staticmethod
+    def _to_sql_identifier(column_name: str) -> str:
+        return f"`{column_name.replace('`', '``')}`"
+
+    def _map_to_sql_identifier(self, value: str) -> str | None:
+        for key in self._candidate_keys(value):
+            mapped = self._canonical_to_actual_columns.get(key)
+            if mapped:
+                return self._to_sql_identifier(mapped)
+        return None
+
+    def _quote_identifiers_in_expression(self, expression: str) -> str:
+        if not isinstance(expression, str) or not expression.strip():
+            return expression
+
+        rewritten = expression
+        for actual in sorted(self.df.columns, key=len, reverse=True):
+            quoted = self._to_sql_identifier(actual)
+            if quoted in rewritten:
+                continue
+            pattern = re.compile(rf"(?<![`\w]){re.escape(actual)}(?![`\w])")
+            rewritten = pattern.sub(quoted, rewritten)
+        return rewritten
+
+    @cached_property
+    def normalized_check(self) -> DQRule:
+        check = self.check
+
+        normalized_column = check.column
+        if isinstance(normalized_column, str):
+            mapped = self._map_to_sql_identifier(normalized_column)
+            if mapped:
+                normalized_column = mapped
+
+        normalized_columns = check.columns
+        if isinstance(normalized_columns, list):
+            tmp_cols: list[str | Column] = []
+            for col in normalized_columns:
+                if isinstance(col, str):
+                    mapped = self._map_to_sql_identifier(col)
+                    tmp_cols.append(mapped if mapped else col)
+                else:
+                    tmp_cols.append(col)
+            normalized_columns = tmp_cols
+
+        normalized_filter = check.filter
+        if isinstance(normalized_filter, str):
+            normalized_filter = self._quote_identifiers_in_expression(normalized_filter)
+
+        normalized_kwargs = dict(check.check_func_kwargs or {})
+        if isinstance(normalized_kwargs.get("column"), str):
+            mapped = self._map_to_sql_identifier(normalized_kwargs["column"])
+            if mapped:
+                normalized_kwargs["column"] = mapped
+        if isinstance(normalized_kwargs.get("columns"), list):
+            normalized_kwargs["columns"] = [
+                self._map_to_sql_identifier(c) if isinstance(c, str) and self._map_to_sql_identifier(c) else c
+                for c in normalized_kwargs["columns"]
+            ]
+
+        normalized_args = list(check.check_func_args or [])
+        if check.check_func is check_funcs.sql_expression:
+            if "expression" in normalized_kwargs and isinstance(normalized_kwargs["expression"], str):
+                normalized_kwargs["expression"] = self._quote_identifiers_in_expression(normalized_kwargs["expression"])
+            elif normalized_args and isinstance(normalized_args[0], str):
+                normalized_args[0] = self._quote_identifiers_in_expression(normalized_args[0])
+
+        return replace(
+            check,
+            column=normalized_column,
+            columns=normalized_columns,
+            filter=normalized_filter,
+            check_func_args=normalized_args,
+            check_func_kwargs=normalized_kwargs,
+        )
+
+    @cached_property
     def user_metadata(self) -> dict[str, str]:
         """
         Returns user metadata as a dictionary.
@@ -65,7 +180,7 @@ class DQRuleManager:
         """
         Returns the filter condition for the check.
         """
-        return F.expr(self.check.filter) if self.check.filter else F.lit(True)
+        return F.expr(self.normalized_check.filter) if self.normalized_check.filter else F.lit(True)
 
     @cached_property
     def invalid_columns(self) -> list[str]:
@@ -74,10 +189,10 @@ class DQRuleManager:
         """
         invalid_cols = []
 
-        if self.check.column is not None and self._is_invalid_column(self.check.column):
-            invalid_cols.append(get_column_name_or_alias(self.check.column))
-        elif self.check.columns is not None:  # either column or columns can be provided, but not both
-            for column in self.check.columns:
+        if self.normalized_check.column is not None and self._is_invalid_column(self.normalized_check.column):
+            invalid_cols.append(get_column_name_or_alias(self.normalized_check.column))
+        elif self.normalized_check.columns is not None:  # either column or columns can be provided, but not both
+            for column in self.normalized_check.columns:
                 if self._is_invalid_column(column):
                     invalid_cols.append(get_column_name_or_alias(column))
 
@@ -102,11 +217,11 @@ class DQRuleManager:
         """
         Returns an invalid expression for sql expression check.
         """
-        if self.check.check_func is check_funcs.sql_expression:
-            if "expression" in self.check.check_func_kwargs:
-                field_value = self.check.check_func_kwargs["expression"]
-            elif self.check.check_func_args:
-                field_value = self.check.check_func_args[0]
+        if self.normalized_check.check_func is check_funcs.sql_expression:
+            if "expression" in self.normalized_check.check_func_kwargs:
+                field_value = self.normalized_check.check_func_kwargs["expression"]
+            elif self.normalized_check.check_func_args:
+                field_value = self.normalized_check.check_func_args[0]
             else:
                 return None  # should never happen, as it is validated for correct args when building rules
 
@@ -129,7 +244,7 @@ class DQRuleManager:
             result_struct = self._build_result_struct(condition=F.lit(invalid_cols_message))
             return DQCheckResult(condition=result_struct, check_df=self.df)
 
-        executor = DQRuleExecutorFactory.create(self.check)
+        executor = DQRuleExecutorFactory.create(self.normalized_check)
         raw_result = executor.apply(self.df, self.spark, self.ref_dfs)
         return self._wrap_result(raw_result)
 

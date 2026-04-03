@@ -13,6 +13,17 @@ from pyspark.sql import SparkSession
 from .logger import logger
 
 
+def get_app_ws() -> WorkspaceClient:
+    """
+    Create a WorkspaceClient using the app's own service principal credentials.
+
+    Unlike get_obo_ws which uses the user's token (and is limited to user_api_scopes),
+    the app service principal has direct workspace access for operations like reading/writing
+    config files that require the Workspace API.
+    """
+    return WorkspaceClient()
+
+
 @contextmanager
 def _without_oauth_env_vars():
     """
@@ -127,6 +138,34 @@ def get_spark(
     return session
 
 
+def get_app_spark() -> SparkSession:
+    """
+    Create a Spark Connect session using the app's service principal credentials.
+
+    Unlike get_spark (which uses the user's OBO token and requires the 'all-apis' scope
+    that can only be granted at the account level), this uses the app's service principal
+    which has direct workspace access. Use this for operations where user-level
+    permissions are not strictly required (e.g., reading app-managed tables).
+    """
+    host = os.environ.get("DATABRICKS_HOST")
+    if not host:
+        logger.info("DATABRICKS_HOST not set, using default configuration for local development")
+        return DatabricksSession.builder.getOrCreate()
+
+    client_id = os.environ.get("DATABRICKS_CLIENT_ID")
+    client_secret = os.environ.get("DATABRICKS_CLIENT_SECRET")
+    if not client_id or not client_secret:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="App service principal credentials are not configured.",
+        )
+
+    logger.info(f"Creating Spark session with app service principal on serverless compute for host: {host}")
+    # In Databricks Apps runtime, host/client credentials are already provided via env vars.
+    # Let Spark Connect read them from the environment to avoid sdkConfig conflicts.
+    return DatabricksSession.builder.serverless().getOrCreate()
+
+
 def get_engine(
     obo_ws: Annotated[WorkspaceClient, Depends(get_obo_ws)], spark: Annotated[SparkSession, Depends(get_spark)]
 ) -> DQEngine:
@@ -157,25 +196,22 @@ def get_engine(
 
 
 def get_generator(
-    obo_ws: Annotated[WorkspaceClient, Depends(get_obo_ws)],
-    spark: Annotated[SparkSession, Depends(get_spark)],
-    token: Annotated[str | None, Header(alias="X-Forwarded-Access-Token")] = None,
+    app_ws: Annotated[WorkspaceClient, Depends(get_app_ws)],
+    spark: Annotated[SparkSession, Depends(get_app_spark)],
 ) -> DQGenerator:
     """
-    Create a DQGenerator instance with OBO authentication and Spark session.
+    Create a DQGenerator instance with app authorization and Spark session.
 
     This dependency provides an AI-assisted data quality rules generator that
     can create checks from natural language descriptions on behalf of the
     logged-in user. The Spark session is used for data profiling and analysis.
 
-    The LLM model is configured to use the OBO token for authentication, ensuring
-    that LLM API calls also run with the user's identity.
+    In Databricks Apps runtime, LLM calls use app credentials from the runtime
+    environment to avoid user-token scope limitations.
 
     Args:
-        obo_ws: WorkspaceClient with OBO authentication (injected by FastAPI).
+        app_ws: WorkspaceClient with app authorization (injected by FastAPI).
         spark: SparkSession for data operations (injected by FastAPI).
-        token: User's OBO token for LLM authentication (injected by FastAPI).
-
     Returns:
         DQGenerator: Configured for AI-assisted rules generation with user context.
 
@@ -185,21 +221,11 @@ def get_generator(
             checks = generator.generate_dq_rules_ai_assisted(user_input=user_input)
             return {"checks": checks}
     """
-    if not token:
-        logger.warning("OBO token is not provided in the header X-Forwarded-Access-Token for Spark session")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Authentication required. Please refresh the page or contact your administrator.",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
     host = os.environ.get("DATABRICKS_HOST", "")
     if host:  # DBX App
-        llm_model_config = LLMModelConfig(
-            api_key=token,  # Configure LLM to use OBO token for authentication
-        )
+        llm_model_config = LLMModelConfig()
     else:  # Local development
         logger.info("DATABRICKS_HOST not set, using default configuration for LLM")
         llm_model_config = LLMModelConfig()
 
-    return DQGenerator(workspace_client=obo_ws, spark=spark, llm_model_config=llm_model_config)
+    return DQGenerator(workspace_client=app_ws, spark=spark, llm_model_config=llm_model_config)

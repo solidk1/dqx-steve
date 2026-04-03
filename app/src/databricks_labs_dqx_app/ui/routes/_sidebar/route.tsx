@@ -1,7 +1,7 @@
 import SidebarLayout from "@/components/apx/SidebarLayout";
 import { createFileRoute, Link, useLocation } from "@tanstack/react-router";
 import { cn } from "@/lib/utils";
-import { FileCode, Settings } from "lucide-react";
+import { Database, FileCode, Home, Settings } from "lucide-react";
 import {
   SidebarGroup,
   SidebarGroupContent,
@@ -17,6 +17,18 @@ function Layout() {
   const location = useLocation();
 
   const navItems = [
+    {
+      to: "/",
+      label: "Home",
+      icon: <Home size={16} />,
+      match: (path: string) => path === "/",
+    },
+    {
+      to: "/explore",
+      label: "Data Explorer",
+      icon: <Database size={16} />,
+      match: (path: string) => path === "/explore",
+    },
     {
       to: "/config",
       label: "Configuration",

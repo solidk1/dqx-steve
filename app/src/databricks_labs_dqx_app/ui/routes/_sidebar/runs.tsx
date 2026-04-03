@@ -19,6 +19,7 @@ import {
   Trash2,
   Save,
   FileCode,
+  Play,
   AlertCircle,
   RotateCcw,
   Loader2,
@@ -59,6 +60,7 @@ import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import { useState, useEffect, Suspense } from "react";
 import yaml from "js-yaml";
+import axios from "axios";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useQueryClient, QueryErrorResetBoundary } from "@tanstack/react-query";
 import { ErrorBoundary } from "react-error-boundary";
@@ -73,6 +75,7 @@ function RunsPage() {
   const currentRunName = params.runName;
   const [isCreateOpen, setIsCreateOpen] = useState(false);
   const [isDeletingRun, setIsDeletingRun] = useState(false);
+  const [isRunningAll, setIsRunningAll] = useState(false);
   const queryClient = useQueryClient();
 
   // We use the non-suspense hook here just to get data for the "Add Run" logic
@@ -87,7 +90,22 @@ function RunsPage() {
   const handleCreateRun = async (name: string) => {
     const newRun: RunConfig = {
       name: name,
-      // Input and Output config are omitted to avoid unnecessary defaults
+      checks_location: "shao_sandbox1.dqx.checks",
+      input_config: {
+        location: name,
+        format: "delta",
+        is_streaming: false,
+        options: {},
+      },
+      output_config: {
+        location: `${name}_dqx_result`,
+        format: "delta",
+        mode: "append",
+        options: {},
+        trigger: {},
+        partition_by: [],
+        cluster_by: [],
+      },
     };
 
     try {
@@ -101,6 +119,21 @@ function RunsPage() {
       toast.error("Failed to create new run");
       console.error(error);
       throw error;
+    }
+  };
+
+  const handleRunAll = async () => {
+    setIsRunningAll(true);
+    try {
+      const response = await axios.post("/api/config/runs/execute");
+      const runId = response?.data?.run_id;
+      const runUrl = response?.data?.run_url;
+      toast.success(`Submitted Run All job. run_id=${runId}. ${runUrl}`);
+    } catch (error: any) {
+      const detail = error?.response?.data?.detail;
+      toast.error(detail ? String(detail) : "Failed to execute all runs");
+    } finally {
+      setIsRunningAll(false);
     }
   };
 
@@ -118,16 +151,28 @@ function RunsPage() {
             <h2 className="font-semibold text-lg text-foreground">
               Run Configurations
             </h2>
-            <Button
-              variant="outline"
-              size="icon"
-              onClick={() => setIsCreateOpen(true)}
-              disabled={!configData}
-              title="Add New Run"
-              className="h-9 w-9"
-            >
-              <Plus className="h-4 w-4" />
-            </Button>
+            <div className="flex items-center gap-2">
+              <Button
+                variant="outline"
+                size="icon"
+                onClick={handleRunAll}
+                disabled={!configData || isRunningAll}
+                title="Run All"
+                className="h-9 w-9"
+              >
+                {isRunningAll ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
+              </Button>
+              <Button
+                variant="outline"
+                size="icon"
+                onClick={() => setIsCreateOpen(true)}
+                disabled={!configData || isRunningAll}
+                title="Add New Run"
+                className="h-9 w-9"
+              >
+                <Plus className="h-4 w-4" />
+              </Button>
+            </div>
           </div>
 
           <div className="flex-1 overflow-y-auto space-y-1">
@@ -445,6 +490,7 @@ function RunEditorContainer({
 
   const [yamlContent, setYamlContent] = useState("");
   const [isDirty, setIsDirty] = useState(false);
+  const [isRunning, setIsRunning] = useState(false);
 
   useEffect(() => {
     if (selectedRun) {
@@ -560,6 +606,24 @@ function RunEditorContainer({
     }
   };
 
+  const handleRunNow = async () => {
+    if (!currentRunName) return;
+    setIsRunning(true);
+    try {
+      const response = await axios.post(
+        `/api/config/run/${encodeURIComponent(currentRunName)}/execute`,
+      );
+      const runId = response?.data?.run_id;
+      const runUrl = response?.data?.run_url;
+      toast.success(`Submitted "${currentRunName}". run_id=${runId}. ${runUrl}`);
+    } catch (error: any) {
+      const detail = error?.response?.data?.detail;
+      toast.error(detail ? String(detail) : `Failed to run "${currentRunName}"`);
+    } finally {
+      setIsRunning(false);
+    }
+  };
+
   if (isDeleting) {
     return (
       <div className="flex-1 flex items-center justify-center">
@@ -592,8 +656,10 @@ function RunEditorContainer({
       onDelete={handleDelete}
       isSaving={isSaving}
       isDeleting={isDeleting}
+      isRunning={isRunning}
       isDeleteOpen={isDeleteOpen}
       setIsDeleteOpen={setIsDeleteOpen}
+      onRunNow={handleRunNow}
     />
   );
 }
@@ -681,8 +747,10 @@ interface RunEditorProps {
   onDelete: () => void;
   isSaving: boolean;
   isDeleting: boolean;
+  isRunning: boolean;
   isDeleteOpen: boolean;
   setIsDeleteOpen: (open: boolean) => void;
+  onRunNow: () => void;
 }
 
 function RunEditor({
@@ -696,10 +764,12 @@ function RunEditor({
   onDelete,
   isSaving,
   isDeleting,
+  isRunning,
   isDeleteOpen,
   setIsDeleteOpen,
+  onRunNow,
 }: RunEditorProps) {
-  const isLocked = isSaving || isDeleting;
+  const isLocked = isSaving || isDeleting || isRunning;
   const [editorMode, setEditorMode] = useState<"form" | "yaml">("form");
 
   return (
@@ -738,6 +808,16 @@ function RunEditor({
 
           {/* Action Buttons */}
           <div className="flex items-center gap-2">
+            <Button
+              onClick={onRunNow}
+              variant="secondary"
+              size="sm"
+              disabled={isLocked}
+              className="gap-2"
+            >
+              {isRunning ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
+              Run now
+            </Button>
             <Button
               variant="ghost"
               size="icon"
@@ -952,12 +1032,12 @@ function FormEditor({
               <Label htmlFor="checks_location">Checks Location</Label>
               <Input
                 id="checks_location"
-                value={formData.checks_location || ""}
+                value={formData.checks_location || "shao_sandbox1.dqx.checks"}
                 onChange={(e) =>
                   updateFormData({ checks_location: e.target.value })
                 }
                 disabled={isLocked}
-                placeholder="e.g., checks.yml or table_name"
+                placeholder="e.g., shao_sandbox1.dqx.checks"
               />
               <p className="text-xs text-muted-foreground">
                 Workspace file path, table name, volume path, or Delta table
@@ -1038,58 +1118,6 @@ function FormEditor({
           </div>
         </section>
 
-        {/* Profiler Configuration */}
-        <section>
-          <h3 className="text-lg font-semibold mb-4">Profiler Configuration</h3>
-          <ProfilerConfigSection
-            config={formData.profiler_config}
-            onUpdate={(config) => updateFormData({ profiler_config: config })}
-            isLocked={isLocked}
-          />
-        </section>
-
-        {/* Lakebase Configuration */}
-        <section>
-          <h3 className="text-lg font-semibold mb-4">Lakebase Configuration</h3>
-          <div className="space-y-4">
-            <div className="grid gap-2">
-              <Label htmlFor="lakebase_instance_name">Instance Name</Label>
-              <Input
-                id="lakebase_instance_name"
-                value={formData.lakebase_instance_name || ""}
-                onChange={(e) =>
-                  updateFormData({ lakebase_instance_name: e.target.value })
-                }
-                disabled={isLocked}
-                placeholder="Optional Lakebase instance name"
-              />
-            </div>
-            <div className="grid gap-2">
-              <Label htmlFor="lakebase_client_id">Client ID</Label>
-              <Input
-                id="lakebase_client_id"
-                value={formData.lakebase_client_id || ""}
-                onChange={(e) =>
-                  updateFormData({ lakebase_client_id: e.target.value })
-                }
-                disabled={isLocked}
-                placeholder="Optional Lakebase Client ID"
-              />
-            </div>
-            <div className="grid gap-2">
-              <Label htmlFor="lakebase_port">Port</Label>
-              <Input
-                id="lakebase_port"
-                value={formData.lakebase_port || ""}
-                onChange={(e) =>
-                  updateFormData({ lakebase_port: e.target.value })
-                }
-                disabled={isLocked}
-                placeholder="Optional Lakebase port"
-              />
-            </div>
-          </div>
-        </section>
       </div>
     </div>
   );
@@ -1216,88 +1244,3 @@ function ConfigSection({
   );
 }
 
-// Profiler Config Section Component
-function ProfilerConfigSection({
-  config,
-  onUpdate,
-  isLocked,
-}: {
-  config: any;
-  onUpdate: (config: any) => void;
-  isLocked: boolean;
-}) {
-  const updateConfig = (updates: any) => {
-    onUpdate({ ...config, ...updates });
-  };
-
-  return (
-    <div className="border border-border/50 rounded-lg p-4 space-y-4">
-      <div className="grid gap-2">
-        <Label htmlFor="profiler-summary-file">Summary Stats File</Label>
-        <Input
-          id="profiler-summary-file"
-          value={config?.summary_stats_file || "profile_summary_stats.yml"}
-          onChange={(e) => updateConfig({ summary_stats_file: e.target.value })}
-          disabled={isLocked}
-          placeholder="profile_summary_stats.yml"
-        />
-      </div>
-
-      <div className="grid gap-2">
-        <Label htmlFor="profiler-sample-fraction">Sample Fraction</Label>
-        <Input
-          id="profiler-sample-fraction"
-          type="number"
-          step="0.1"
-          min="0"
-          max="1"
-          value={config?.sample_fraction || 0.3}
-          onChange={(e) =>
-            updateConfig({ sample_fraction: parseFloat(e.target.value) })
-          }
-          disabled={isLocked}
-          placeholder="0.3"
-        />
-      </div>
-
-      <div className="grid gap-2">
-        <Label htmlFor="profiler-limit">Limit</Label>
-        <Input
-          id="profiler-limit"
-          type="number"
-          value={config?.limit || 1000}
-          onChange={(e) => updateConfig({ limit: parseInt(e.target.value) })}
-          disabled={isLocked}
-          placeholder="1000"
-        />
-      </div>
-
-      <div className="grid gap-2">
-        <Label htmlFor="profiler-sample-seed">Sample Seed</Label>
-        <Input
-          id="profiler-sample-seed"
-          type="number"
-          value={config?.sample_seed || ""}
-          onChange={(e) =>
-            updateConfig({
-              sample_seed: e.target.value ? parseInt(e.target.value) : null,
-            })
-          }
-          disabled={isLocked}
-          placeholder="Optional seed for sampling"
-        />
-      </div>
-
-      <div className="grid gap-2">
-        <Label htmlFor="profiler-filter">Filter</Label>
-        <Input
-          id="profiler-filter"
-          value={config?.filter || ""}
-          onChange={(e) => updateConfig({ filter: e.target.value || null })}
-          disabled={isLocked}
-          placeholder="Optional filter expression"
-        />
-      </div>
-    </div>
-  );
-}

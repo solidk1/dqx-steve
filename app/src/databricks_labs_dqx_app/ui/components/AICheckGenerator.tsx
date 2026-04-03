@@ -8,13 +8,16 @@ import { toast } from "sonner";
 
 interface AICheckGeneratorProps {
   onGenerate: (userInput: string) => Promise<{ yaml_output: string; checks: any[] }>;
+  onConfirmSave?: (checks: any[]) => Promise<void>;
   isGenerating: boolean;
 }
 
-export function AICheckGenerator({ onGenerate, isGenerating }: AICheckGeneratorProps) {
+export function AICheckGenerator({ onGenerate, onConfirmSave, isGenerating }: AICheckGeneratorProps) {
   const [userInput, setUserInput] = useState("");
   const [generatedYaml, setGeneratedYaml] = useState<string | null>(null);
+  const [generatedChecks, setGeneratedChecks] = useState<any[] | null>(null);
   const [copied, setCopied] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
 
   const handleGenerate = async () => {
     if (!userInput.trim()) {
@@ -25,10 +28,36 @@ export function AICheckGenerator({ onGenerate, isGenerating }: AICheckGeneratorP
     try {
       const result = await onGenerate(userInput);
       setGeneratedYaml(result.yaml_output);
+      setGeneratedChecks(result.checks);
       toast.success("Checks generated successfully!");
     } catch (error) {
       console.error("Failed to generate checks:", error);
-      toast.error("Failed to generate checks. Please try again.");
+      const detail =
+        (error as any)?.response?.data?.detail ||
+        (error as Error)?.message ||
+        "Please try again.";
+      toast.error(`Failed to generate checks: ${detail}`);
+    }
+  };
+
+  const handleConfirmSave = async () => {
+    if (!onConfirmSave || !generatedChecks || generatedChecks.length === 0) return;
+
+    const confirmed = window.confirm("Save generated checks to shao_sandbox1.dqx.checks?");
+    if (!confirmed) return;
+
+    try {
+      setIsSaving(true);
+      await onConfirmSave(generatedChecks);
+      toast.success("Generated checks saved successfully!");
+    } catch (error) {
+      const detail =
+        (error as any)?.response?.data?.detail ||
+        (error as Error)?.message ||
+        "Please try again.";
+      toast.error(`Failed to save generated checks: ${detail}`);
+    } finally {
+      setIsSaving(false);
     }
   };
 
@@ -79,24 +108,42 @@ export function AICheckGenerator({ onGenerate, isGenerating }: AICheckGeneratorP
                 <h3 className="text-sm font-semibold text-muted-foreground">
                   Generated Checks
                 </h3>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={handleCopy}
-                  className="gap-2"
-                >
-                  {copied ? (
-                    <>
-                      <Check className="h-3 w-3" />
-                      Copied
-                    </>
-                  ) : (
-                    <>
-                      <Copy className="h-3 w-3" />
-                      Copy
-                    </>
+                <div className="flex items-center gap-2">
+                  {onConfirmSave && (
+                    <Button
+                      size="sm"
+                      onClick={handleConfirmSave}
+                      disabled={isSaving || isGenerating}
+                    >
+                      {isSaving ? (
+                        <>
+                          <Loader2 className="h-3 w-3 mr-2 animate-spin" />
+                          Saving...
+                        </>
+                      ) : (
+                        "Confirm & Save"
+                      )}
+                    </Button>
                   )}
-                </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={handleCopy}
+                    className="gap-2"
+                  >
+                    {copied ? (
+                      <>
+                        <Check className="h-3 w-3" />
+                        Copied
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="h-3 w-3" />
+                        Copy
+                      </>
+                    )}
+                  </Button>
+                </div>
               </div>
               <Card className="flex-1 overflow-auto p-4 bg-card/50 backdrop-blur-sm">
                 <pre className="text-xs font-mono whitespace-pre-wrap break-words">

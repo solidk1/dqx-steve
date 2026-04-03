@@ -1,2 +1,6 @@
 command:
-  ["uvicorn", "databricks_labs_dqx_app.backend.app:app", "--workers", "2"]
+  [
+    "bash",
+    "-lc",
+    "./.venv/bin/pip install --upgrade /app/python/source_code/*.whl && uvicorn databricks_labs_dqx_app.backend.app:app --workers 2",
+  ]

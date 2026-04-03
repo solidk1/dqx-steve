@@ -417,15 +417,36 @@ function RunConfigCount() {
 }
 
 function SectionError({
+  error,
   resetErrorBoundary,
 }: {
+  error: unknown;
   resetErrorBoundary: () => void;
 }) {
+  const detail =
+    typeof error === "object" &&
+    error !== null &&
+    "response" in error &&
+    typeof (error as { response?: unknown }).response === "object" &&
+    (error as { response?: { data?: { detail?: unknown } } }).response?.data &&
+    typeof (error as { response?: { data?: { detail?: unknown } } }).response?.data ===
+      "object"
+      ? (error as { response?: { data?: { detail?: unknown } } }).response?.data?.detail
+      : undefined;
+
+  const errorMessage =
+    typeof detail === "string"
+      ? detail
+      : error instanceof Error
+        ? error.message
+        : "Unknown error";
+
   return (
     <div className="flex flex-col gap-2 items-start">
       <p className="text-sm text-destructive flex items-center gap-1">
         <AlertCircle className="h-4 w-4" /> Failed to load section
       </p>
+      <p className="text-xs text-muted-foreground max-w-xl">{errorMessage}</p>
       <Button variant="outline" size="sm" onClick={resetErrorBoundary}>
         Retry
       </Button>

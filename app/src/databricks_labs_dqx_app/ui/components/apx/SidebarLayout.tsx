@@ -39,8 +39,8 @@ function SidebarLayout({ children }: SidebarLayoutProps) {
           <div className="flex-1" />
           <ModeToggle />
         </header>
-        <div className="flex flex-1 justify-center overflow-auto">
-          <div className="flex flex-1 flex-col gap-4 p-6 max-w-7xl mx-auto">
+        <div className="flex flex-1 overflow-y-auto overflow-x-hidden min-w-0">
+          <div className="flex flex-1 flex-col gap-4 p-6 min-w-0">
             <Outlet />
           </div>
         </div>

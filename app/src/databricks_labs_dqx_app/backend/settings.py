@@ -12,10 +12,19 @@ from .models import InstallationSettings
 
 
 class SettingsManager:
-    def __init__(self, ws: WorkspaceClient):
+    def __init__(self, ws: WorkspaceClient, user_name: str | None = None):
+        """
+        Args:
+            ws: WorkspaceClient used for file operations (mkdirs, upload, export).
+            user_name: The workspace username whose home folder hosts settings.
+                       If not provided, falls back to ws.current_user.me().
+        """
         self.ws = ws
-        self.user = ws.current_user.me()
-        self.user_home = f"/Users/{self.user.user_name}"
+        if user_name:
+            self.user_name = user_name
+        else:
+            self.user_name = ws.current_user.me().user_name
+        self.user_home = f"/Users/{self.user_name}"
         self.default_dqx_folder = f"{self.user_home}/.dqx"
         self.app_settings_path = f"{self.default_dqx_folder}/app.yml"
 
@@ -57,7 +66,6 @@ class SettingsManager:
         """
         install_folder = settings.install_folder.strip()
 
-        # Ensure the .dqx folder exists (where app.yml lives)
         try:
             self.ws.workspace.mkdirs(self.default_dqx_folder)
         except Exception as e:
@@ -65,14 +73,12 @@ class SettingsManager:
             raise ValueError(f"Could not create .dqx folder: {self.default_dqx_folder}") from e
 
         if install_folder != self.default_dqx_folder:
-            # Ensure the install folder exists (create if needed)
             try:
                 self.ws.workspace.mkdirs(install_folder)
             except Exception as e:
                 logger.error(f"Failed to create install folder {install_folder}: {e}")
                 raise ValueError(f"Could not create install folder: {install_folder}") from e
 
-        # Save app.yml with info about install folder
         content = yaml.dump({"install_folder": install_folder})
         content_bytes = content.encode("utf-8")
 
