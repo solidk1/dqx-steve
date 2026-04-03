@@ -1,6 +1,6 @@
 from typing import Any
 
-from databricks.labs.dqx.config import RunConfig, WorkspaceConfig
+from databricks.labs.dqx.config import WorkspaceConfig
 from pydantic import BaseModel, Field
 
 from .. import __version__
@@ -20,14 +20,6 @@ class ConfigOut(BaseModel):
 
 class ConfigIn(BaseModel):
     config: WorkspaceConfig
-
-
-class RunConfigOut(BaseModel):
-    config: RunConfig
-
-
-class RunConfigIn(BaseModel):
-    config: RunConfig
 
 
 class ChecksOut(BaseModel):
@@ -117,25 +109,12 @@ class CheckErrorRowsOut(BaseModel):
     columns: list[str] = Field(default_factory=list)
 
 
-class ExecuteRunOut(BaseModel):
-    run_name: str = Field(description="Run configuration name that was executed")
-    status: str = Field(description="Execution status")
-    run_id: int = Field(description="Submitted Databricks run ID")
-    run_url: str = Field(description="Databricks run URL")
-
-
 class DashboardOut(BaseModel):
     dashboard_id: str = Field(description="Databricks AI/BI dashboard ID")
     embed_url: str = Field(description="Published dashboard URL for embedding")
     instance_url: str = Field(description="Databricks workspace instance URL")
     workspace_id: str = Field(description="Databricks workspace ID")
     token: str = Field(description="OBO token for embedding")
-
-
-class ExecuteRunsOut(BaseModel):
-    status: str = Field(description="Execution status")
-    run_id: int = Field(description="Submitted Databricks run ID")
-    run_url: str = Field(description="Databricks run URL")
 
 
 class RunChecksJobOut(BaseModel):

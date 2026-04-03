@@ -8,13 +8,12 @@ from databricks.labs.blueprint.installation import Installation
 from databricks.labs.dqx.profiler.generator import DQGenerator
 from databricks.labs.dqx.config import (
     InputConfig,
-    InstallationChecksStorageConfig,
     TableChecksStorageConfig,
     WorkspaceConfig,
 )
 from databricks.labs.dqx.config_serializer import ConfigSerializer
 from databricks.labs.dqx.engine import DQEngine
-from databricks.labs.dqx.errors import InvalidCheckError, InvalidConfigError
+from databricks.labs.dqx.errors import InvalidConfigError
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.errors import NotFound, PermissionDenied, ResourceDoesNotExist
 from databricks.sdk.service import compute, jobs
@@ -24,7 +23,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pyspark.sql import SparkSession
 
 from .config import conf
-from .dependencies import get_app_spark, get_app_ws, get_engine, get_generator, get_obo_ws
+from .dependencies import get_app_spark, get_app_ws, get_generator, get_obo_ws
 from .logger import logger
 from .models import (
     CheckErrorRowsOut,
@@ -36,13 +35,9 @@ from .models import (
     ConfigIn,
     ConfigOut,
     DashboardOut,
-    ExecuteRunOut,
-    ExecuteRunsOut,
     GenerateChecksIn,
     GenerateChecksOut,
     InstallationSettings,
-    RunConfigIn,
-    RunConfigOut,
     RunChecksJobOut,
     SchemasOut,
     SaveGeneratedChecksIn,
@@ -129,162 +124,6 @@ def save_config(
     serializer = ConfigSerializer(app_ws)
     serializer.save_config(body.config, install_folder=install_folder)
     return ConfigOut(config=serializer.load_config(install_folder=install_folder))
-
-
-@api.get("/config/run/{name}", response_model=RunConfigOut, operation_id="get_run_config")
-def get_run_config(
-    name: str,
-    app_ws: Annotated[WorkspaceClient, Depends(get_app_ws)],
-    path: str | None = Query(None, description="Path to the configuration folder"),
-) -> RunConfigOut:
-    install_folder = get_install_folder(app_ws, path)
-    serializer = ConfigSerializer(app_ws)
-    try:
-        return RunConfigOut(config=serializer.load_run_config(run_config_name=name, install_folder=install_folder))
-    except (ResourceDoesNotExist, InvalidConfigError):
-        raise HTTPException(status_code=404, detail=f"Run config '{name}' not found")
-
-
-@api.post("/config/run", response_model=RunConfigOut, operation_id="save_run_config")
-def save_run_config(
-    body: RunConfigIn,
-    app_ws: Annotated[WorkspaceClient, Depends(get_app_ws)],
-    path: str | None = Query(None, description="Path to the configuration folder"),
-) -> RunConfigOut:
-    install_folder = get_install_folder(app_ws, path)
-    serializer = ConfigSerializer(app_ws)
-    try:
-        serializer.save_run_config(body.config, install_folder=install_folder)
-    except (ResourceDoesNotExist, PermissionDenied):
-        # Config or folder doesn't exist yet — bootstrap via SettingsManager
-        settings_mgr = SettingsManager(app_ws)
-        settings_mgr.save_settings(InstallationSettings(install_folder=install_folder))
-        # Now retry the save
-        serializer.save_run_config(body.config, install_folder=install_folder)
-    return RunConfigOut(
-        config=serializer.load_run_config(run_config_name=body.config.name, install_folder=install_folder)
-    )
-
-
-@api.delete("/config/run/{name}", response_model=ConfigOut, operation_id="delete_run_config")
-def delete_run_config(
-    name: str,
-    app_ws: Annotated[WorkspaceClient, Depends(get_app_ws)],
-    path: str | None = Query(None, description="Path to the configuration folder"),
-) -> ConfigOut:
-    install_folder = get_install_folder(app_ws, path)
-    serializer = ConfigSerializer(app_ws)
-
-    try:
-        config = serializer.load_config(install_folder=install_folder)
-    except (ResourceDoesNotExist, InvalidConfigError):
-        raise HTTPException(status_code=404, detail=f"Configuration not found at {install_folder}")
-
-    original_count = len(config.run_configs)
-    config.run_configs = [rc for rc in config.run_configs if rc.name != name]
-
-    if len(config.run_configs) == original_count:
-        raise HTTPException(status_code=404, detail=f"Run config '{name}' not found")
-
-    serializer.save_config(config, install_folder=install_folder)
-    return ConfigOut(config=config)
-
-
-@api.get("/config/run/{name}/checks", response_model=ChecksOut, operation_id="get_run_checks")
-def get_run_checks(
-    name: str,
-    app_ws: Annotated[WorkspaceClient, Depends(get_app_ws)],
-    engine: Annotated[DQEngine, Depends(get_engine)],
-    path: str | None = Query(None, description="Path to the configuration folder"),
-) -> ChecksOut:
-    install_folder = get_install_folder(app_ws, path)
-    serializer = ConfigSerializer(app_ws)
-    try:
-        run_config = serializer.load_run_config(run_config_name=name, install_folder=install_folder)
-    except (ResourceDoesNotExist, InvalidConfigError):
-        raise HTTPException(status_code=404, detail=f"Run config '{name}' not found")
-
-    checks_config = InstallationChecksStorageConfig(run_config_name=run_config.name, install_folder=install_folder)
-
-    try:
-        checks = engine.load_checks(checks_config)
-        return ChecksOut(checks=checks)
-    except (NotFound, FileNotFoundError):
-        return ChecksOut(checks=[])
-    except InvalidCheckError as e:
-        raise HTTPException(status_code=400, detail=f"Invalid checks format: {e}")
-    except InvalidConfigError as e:
-        raise HTTPException(status_code=400, detail=f"Invalid configuration: {e}")
-
-
-@api.post("/config/run/{name}/checks", response_model=ChecksOut, operation_id="save_run_checks")
-def save_run_checks(
-    name: str,
-    body: ChecksIn,
-    app_ws: Annotated[WorkspaceClient, Depends(get_app_ws)],
-    engine: Annotated[DQEngine, Depends(get_engine)],
-    path: str | None = Query(None, description="Path to the configuration folder"),
-) -> ChecksOut:
-    install_folder = get_install_folder(app_ws, path)
-    serializer = ConfigSerializer(app_ws)
-    try:
-        run_config = serializer.load_run_config(run_config_name=name, install_folder=install_folder)
-    except (ResourceDoesNotExist, InvalidConfigError):
-        raise HTTPException(status_code=404, detail=f"Run config '{name}' not found")
-
-    checks_config = InstallationChecksStorageConfig(run_config_name=run_config.name, install_folder=install_folder)
-    engine.save_checks(body.checks, checks_config)
-    return ChecksOut(checks=body.checks)
-
-
-@api.post("/config/run/{name}/execute", response_model=ExecuteRunOut, operation_id="execute_run_config")
-def execute_run_config(
-    name: str,
-    app_ws: Annotated[WorkspaceClient, Depends(get_app_ws)],
-    path: str | None = Query(None, description="Path to the configuration folder"),
-) -> ExecuteRunOut:
-    install_folder = get_install_folder(app_ws, path)
-    serializer = ConfigSerializer(app_ws)
-    try:
-        run_config = serializer.load_run_config(run_config_name=name, install_folder=install_folder)
-    except (ResourceDoesNotExist, InvalidConfigError):
-        raise HTTPException(status_code=404, detail=f"Run config '{name}' not found")
-
-    try:
-        run_id, run_url = _submit_dqx_run(app_ws, install_folder, run_config_name=name)
-        return ExecuteRunOut(run_name=name, status="submitted", run_id=run_id, run_url=run_url)
-    except Exception as e:
-        logger.error(f"Failed to submit run config '{name}': {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to submit run '{name}': {e}")
-
-
-@api.post("/config/runs/execute", response_model=ExecuteRunsOut, operation_id="execute_all_run_configs")
-def execute_all_run_configs(
-    app_ws: Annotated[WorkspaceClient, Depends(get_app_ws)],
-    path: str | None = Query(None, description="Path to the configuration folder"),
-) -> ExecuteRunsOut:
-    install_folder = get_install_folder(app_ws, path)
-    serializer = ConfigSerializer(app_ws)
-    try:
-        config = serializer.load_config(install_folder=install_folder)
-    except ResourceDoesNotExist:
-        raise HTTPException(status_code=400, detail="No run configs found in config.yml")
-    except InvalidConfigError as e:
-        raise HTTPException(status_code=400, detail=f"Invalid configuration: {e}")
-    except Exception as e:
-        logger.error(f"Failed to load config for executing runs from '{install_folder}': {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to load run configs: {e}")
-
-    run_configs = config.run_configs or []
-    if not run_configs:
-        raise HTTPException(status_code=400, detail="No run configs found in config.yml")
-
-    try:
-        run_id, run_url = _submit_dqx_run(app_ws, install_folder, run_config_name="")
-        return ExecuteRunsOut(status="submitted", run_id=run_id, run_url=run_url)
-    except Exception as e:
-        logger.error(f"Failed to submit all run configs: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to submit all runs: {e}")
 
 
 @api.post("/ai-generate-checks", response_model=GenerateChecksOut, operation_id="ai_assisted_checks_generation")
@@ -521,52 +360,6 @@ def _format_spark_error_message(error: Exception) -> str:
         return f"Table not found. {message}"
     return message
 
-
-def _submit_dqx_run(
-    ws: WorkspaceClient,
-    install_folder: str,
-    run_config_name: str,
-) -> tuple[int, str]:
-    """Submit a one-time serverless DQX quality-checker run via jobs.submit."""
-    config_path = f"/Workspace{install_folder.rstrip('/')}/config.yml"
-    named_parameters = {
-        "config": config_path,
-        "run_config_name": run_config_name,
-        "workflow": "quality-checker",
-        "task": "apply_checks",
-    }
-
-    label = run_config_name or "all"
-    response = ws.jobs.submit(
-        run_name=f"DQX quality-checker ({label})",
-        tasks=[
-            jobs.SubmitTask(
-                task_key="apply_checks",
-                environment_key="default",
-                python_wheel_task=jobs.PythonWheelTask(
-                    package_name="databricks_labs_dqx",
-                    entry_point="runtime",
-                    named_parameters=named_parameters,
-                ),
-            )
-        ],
-        environments=[
-            jobs.JobEnvironment(
-                environment_key="default",
-                spec=compute.Environment(
-                    client="1",
-                    dependencies=["databricks-labs-dqx"],
-                ),
-            )
-        ],
-    )
-
-    run_id = response.run_id
-    if run_id is None:
-        raise RuntimeError("Job submission succeeded but run_id is missing")
-    host = (ws.config.host or "").rstrip("/")
-    run_url = f"{host}/#job/runs/{int(run_id)}"
-    return int(run_id), run_url
 
 
 

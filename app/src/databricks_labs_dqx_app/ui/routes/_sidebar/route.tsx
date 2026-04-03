@@ -1,7 +1,7 @@
 import SidebarLayout from "@/components/apx/SidebarLayout";
 import { createFileRoute, Link, useLocation } from "@tanstack/react-router";
 import { cn } from "@/lib/utils";
-import { Database, FileCode, Home, Settings } from "lucide-react";
+import { Database, Home, Settings } from "lucide-react";
 import {
   SidebarGroup,
   SidebarGroupContent,
@@ -34,12 +34,6 @@ function Layout() {
       label: "Configuration",
       icon: <Settings size={16} />,
       match: (path: string) => path === "/config",
-    },
-    {
-      to: "/runs",
-      label: "Runs",
-      icon: <FileCode size={16} />,
-      match: (path: string) => path.startsWith("/runs"),
     },
   ];
 

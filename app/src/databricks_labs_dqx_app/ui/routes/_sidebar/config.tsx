@@ -1,4 +1,4 @@
-import { createFileRoute, Link } from "@tanstack/react-router";
+import { createFileRoute } from "@tanstack/react-router";
 import { Suspense, useState, useEffect } from "react";
 import { QueryErrorResetBoundary, useQueryClient } from "@tanstack/react-query";
 import { ErrorBoundary } from "react-error-boundary";
@@ -13,14 +13,12 @@ import selector from "@/lib/selector";
 import {
   Card,
   CardContent,
-  CardDescription,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Separator } from "@/components/ui/separator";
 import { Input } from "@/components/ui/input";
 import { PageBreadcrumb } from "@/components/apx/PageBreadcrumb";
 import {
@@ -32,17 +30,11 @@ import { Label } from "@/components/ui/label";
 import {
   AlertCircle,
   Settings,
-  Database,
-  Server,
-  Activity,
   Eye,
   Code2,
   Save,
   RefreshCw,
-  ChevronRight,
-  Package,
   UploadCloud,
-  LayoutDashboard,
   Loader2,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -238,183 +230,6 @@ function GeneralSettingsData() {
   );
 }
 
-function RunConfigsData() {
-  const {
-    data: { config },
-  } = useConfigSuspense(undefined, selector());
-
-  if (!config.run_configs || config.run_configs.length === 0) {
-    return (
-      <p className="text-muted-foreground text-sm">
-        No run configurations defined.
-      </p>
-    );
-  }
-
-  return (
-    <div className="space-y-4">
-      {config.run_configs.map((runConfig, index) => (
-        <Card
-          key={index}
-          className="bg-card/50 backdrop-blur-sm border-border/50 transition-all hover:border-primary/20 hover:shadow-sm"
-        >
-          <CardContent className="grid gap-2 p-4">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-3">
-                <h3 className="font-semibold text-lg">
-                  {runConfig.name || `Config ${index + 1}`}
-                </h3>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="h-7 gap-1.5 text-xs"
-                  asChild
-                >
-                  <Link to="/runs">
-                    <LayoutDashboard className="h-3.5 w-3.5" />
-                    Manage Run
-                    <ChevronRight className="h-3 w-3 opacity-50" />
-                  </Link>
-                </Button>
-              </div>
-              <div className="flex gap-2">
-                {runConfig.warehouse_id && (
-                  <Badge
-                    variant="outline"
-                    className="font-mono text-xs flex items-center gap-1 bg-background/50"
-                  >
-                    <Server className="h-3 w-3" />
-                    {runConfig.warehouse_id}
-                  </Badge>
-                )}
-                {runConfig.lakebase_instance_name && (
-                  <Badge
-                    variant="secondary"
-                    className="font-mono text-xs flex items-center gap-1"
-                  >
-                    <Database className="h-3 w-3" />
-                    {runConfig.lakebase_instance_name}
-                  </Badge>
-                )}
-              </div>
-            </div>
-
-            <Separator className="my-2 opacity-50" />
-
-            <div className="grid md:grid-cols-2 gap-4 text-sm">
-              <div className="space-y-1">
-                <span className="font-medium text-muted-foreground flex items-center gap-1">
-                  <Package className="h-3 w-3" /> Input
-                </span>
-                <div className="pl-4 border-l-2 border-primary/20">
-                  <p>
-                    Location:{" "}
-                    <span className="font-mono text-xs">
-                      {runConfig.input_config?.location}
-                    </span>
-                  </p>
-                  {runConfig.input_config?.format && (
-                    <p>Format: {runConfig.input_config.format}</p>
-                  )}
-                </div>
-              </div>
-
-              <div className="space-y-1">
-                <span className="font-medium text-muted-foreground flex items-center gap-1">
-                  <Database className="h-3 w-3" /> Output
-                </span>
-                <div className="pl-4 border-l-2 border-primary/20">
-                  <p>
-                    Location:{" "}
-                    <span className="font-mono text-xs">
-                      {runConfig.output_config?.location}
-                    </span>
-                  </p>
-                  {runConfig.output_config?.mode && (
-                    <p>Mode: {runConfig.output_config.mode}</p>
-                  )}
-                </div>
-              </div>
-            </div>
-
-            {runConfig.checks_location && (
-              <div className="text-sm mt-2 pt-2 border-t border-border/30">
-                <span className="font-medium text-muted-foreground">
-                  Checks Location:{" "}
-                </span>
-                <span className="font-mono text-xs bg-muted/50 px-1 py-0.5 rounded">
-                  {runConfig.checks_location}
-                </span>
-              </div>
-            )}
-          </CardContent>
-        </Card>
-      ))}
-    </div>
-  );
-}
-
-function ClusterOverridesCard() {
-  const {
-    data: { config },
-  } = useConfigSuspense(undefined, selector());
-
-  if (
-    !config.profiler_override_clusters &&
-    !config.quality_checker_override_clusters &&
-    !config.e2e_override_clusters
-  ) {
-    return null;
-  }
-
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
-          <Server className="h-5 w-5" />
-          Cluster Overrides
-        </CardTitle>
-      </CardHeader>
-      <CardContent className="space-y-4">
-        {config.profiler_override_clusters && (
-          <div>
-            <h4 className="font-medium mb-2">Profiler</h4>
-            <pre className="bg-muted p-2 rounded-md text-xs overflow-x-auto">
-              {JSON.stringify(config.profiler_override_clusters, null, 2)}
-            </pre>
-          </div>
-        )}
-        {config.quality_checker_override_clusters && (
-          <div>
-            <h4 className="font-medium mb-2">Quality Checker</h4>
-            <pre className="bg-muted p-2 rounded-md text-xs overflow-x-auto">
-              {JSON.stringify(
-                config.quality_checker_override_clusters,
-                null,
-                2,
-              )}
-            </pre>
-          </div>
-        )}
-        {config.e2e_override_clusters && (
-          <div>
-            <h4 className="font-medium mb-2">E2E Tests</h4>
-            <pre className="bg-muted p-2 rounded-md text-xs overflow-x-auto">
-              {JSON.stringify(config.e2e_override_clusters, null, 2)}
-            </pre>
-          </div>
-        )}
-      </CardContent>
-    </Card>
-  );
-}
-
-function RunConfigCount() {
-  const {
-    data: { config },
-  } = useConfigSuspense(undefined, selector());
-  return <>({config.run_configs?.length || 0})</>;
-}
 
 function SectionError({
   error,
@@ -655,57 +470,6 @@ function ConfigPage() {
                   </Card>
                 </FadeIn>
 
-                {/* Run Configs */}
-                <FadeIn delay={0.2}>
-                  <Card className="border-0 shadow-none bg-transparent">
-                    <CardHeader className="px-0">
-                      <CardTitle className="flex items-center gap-2">
-                        <Activity className="h-5 w-5" />
-                        Run Configurations
-                        <ErrorBoundary onReset={reset} fallback={null}>
-                          <Suspense
-                            fallback={
-                              <Skeleton className="h-4 w-8 inline-block ml-2" />
-                            }
-                          >
-                            <span className="ml-1 text-sm font-normal text-muted-foreground">
-                              <RunConfigCount />
-                            </span>
-                          </Suspense>
-                        </ErrorBoundary>
-                      </CardTitle>
-                      <CardDescription>
-                        Defined run configurations
-                      </CardDescription>
-                    </CardHeader>
-                    <CardContent className="px-0">
-                      <ErrorBoundary
-                        onReset={reset}
-                        fallbackRender={SectionError}
-                      >
-                        <Suspense
-                          fallback={
-                            <div className="space-y-4">
-                              <Skeleton className="h-32 w-full" />
-                              <Skeleton className="h-32 w-full" />
-                            </div>
-                          }
-                        >
-                          <RunConfigsData />
-                        </Suspense>
-                      </ErrorBoundary>
-                    </CardContent>
-                  </Card>
-                </FadeIn>
-
-                {/* Cluster Overrides - Entire card is dynamic */}
-                <ErrorBoundary onReset={reset} fallback={null}>
-                  <Suspense fallback={null}>
-                    <FadeIn delay={0.3}>
-                      <ClusterOverridesCard />
-                    </FadeIn>
-                  </Suspense>
-                </ErrorBoundary>
               </div>
             ) : (
               <ErrorBoundary onReset={reset} fallbackRender={SectionError}>
