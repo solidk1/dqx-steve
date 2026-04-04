@@ -1,11 +1,20 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { Card } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Badge } from "@/components/ui/badge";
 import { Loader2, ArrowRight, Copy, Sparkles, Check, Database } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { toast } from "sonner";
-import { load } from "js-yaml";
+import {
+  buildEditableGeneratedChecks,
+  getSelectedGeneratedChecks,
+  isEditableThresholdArgument,
+  parseGeneratedChecksYaml,
+  serializeGeneratedChecksToYaml,
+  type EditableGeneratedCheck,
+} from "@/lib/generated-checks";
 
 interface AICheckGeneratorProps {
   onGenerate: (userInput: string) => Promise<{ yaml_output: string; checks: any[] }>;
@@ -24,8 +33,29 @@ export function AICheckGenerator({
 }: AICheckGeneratorProps) {
   const [userInput, setUserInput] = useState("");
   const [generatedYaml, setGeneratedYaml] = useState<string | null>(null);
+  const [editableChecks, setEditableChecks] = useState<EditableGeneratedCheck[]>([]);
   const [copied, setCopied] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
+  const [yamlError, setYamlError] = useState<string | null>(null);
+
+  const selectedCount = useMemo(
+    () => getSelectedGeneratedChecks(editableChecks).length,
+    [editableChecks],
+  );
+  const totalCount = editableChecks.length;
+
+  const syncChecksToYaml = (nextChecks: EditableGeneratedCheck[]) => {
+    setEditableChecks(nextChecks);
+    setGeneratedYaml(serializeGeneratedChecksToYaml(nextChecks));
+    setYamlError(null);
+  };
+
+  const loadGeneratedResult = (result: { yaml_output: string; checks: any[] }) => {
+    const nextChecks = buildEditableGeneratedChecks(result.checks);
+    setEditableChecks(nextChecks);
+    setGeneratedYaml(serializeGeneratedChecksToYaml(nextChecks));
+    setYamlError(null);
+  };
 
   const handleGenerate = async () => {
     if (!userInput.trim()) {
@@ -35,7 +65,7 @@ export function AICheckGenerator({
 
     try {
       const result = await onGenerate(userInput);
-      setGeneratedYaml(result.yaml_output);
+      loadGeneratedResult(result);
       toast.success("Checks generated successfully!");
     } catch (error) {
       console.error("Failed to generate checks:", error);
@@ -52,7 +82,7 @@ export function AICheckGenerator({
 
     try {
       const result = await onSuggestWholeTable();
-      setGeneratedYaml(result.yaml_output);
+      loadGeneratedResult(result);
       toast.success("Profile-based checks generated successfully!");
     } catch (error) {
       console.error("Failed to generate profile-based checks:", error);
@@ -69,19 +99,132 @@ export function AICheckGenerator({
       throw new Error("No generated YAML to save.");
     }
 
-    const parsed = load(generatedYaml);
-    if (!Array.isArray(parsed)) {
-      throw new Error("Generated YAML must be a list of checks.");
+    return parseGeneratedChecksYaml(generatedYaml);
+  };
+
+  const handleYamlChange = (nextYaml: string) => {
+    setGeneratedYaml(nextYaml);
+
+    try {
+      const parsedChecks = parseGeneratedChecksYaml(nextYaml);
+      setEditableChecks((currentChecks) =>
+        buildEditableGeneratedChecks(parsedChecks, currentChecks),
+      );
+      setYamlError(null);
+    } catch (error) {
+      setYamlError((error as Error).message || "Please fix the YAML before saving.");
     }
-    return parsed as any[];
+  };
+
+  const updateEditableChecks = (
+    updater: (currentChecks: EditableGeneratedCheck[]) => EditableGeneratedCheck[],
+  ) => {
+    setEditableChecks((currentChecks) => {
+      const nextChecks = updater(currentChecks);
+      setGeneratedYaml(serializeGeneratedChecksToYaml(nextChecks));
+      setYamlError(null);
+      return nextChecks;
+    });
+  };
+
+  const handleToggleSelection = (id: string, selected: boolean) => {
+    updateEditableChecks((currentChecks) =>
+      currentChecks.map((item) =>
+        item.id === id ? { ...item, selected } : item,
+      ),
+    );
+  };
+
+  const handleSelectAll = (selected: boolean) => {
+    updateEditableChecks((currentChecks) =>
+      currentChecks.map((item) => ({ ...item, selected })),
+    );
+  };
+
+  const handleCheckFieldChange = (
+    id: string,
+    field: "name" | "description",
+    value: string,
+  ) => {
+    updateEditableChecks((currentChecks) =>
+      currentChecks.map((item) =>
+        item.id === id
+          ? {
+              ...item,
+              check: {
+                ...item.check,
+                [field]: value,
+              },
+            }
+          : item,
+      ),
+    );
+  };
+
+  const handleThresholdArgumentChange = (
+    id: string,
+    argumentName: string,
+    rawValue: string,
+  ) => {
+    updateEditableChecks((currentChecks) =>
+      currentChecks.map((item) => {
+        if (item.id !== id) {
+          return item;
+        }
+
+        const checkObject =
+          item.check.check && typeof item.check.check === "object"
+            ? item.check.check
+            : {};
+        const argumentsObject =
+          checkObject.arguments && typeof checkObject.arguments === "object"
+            ? checkObject.arguments
+            : {};
+        const currentValue = argumentsObject[argumentName];
+
+        let nextValue: string | number = rawValue;
+        if (typeof currentValue === "number" && rawValue.trim() !== "") {
+          const parsedNumber = Number(rawValue);
+          nextValue = Number.isFinite(parsedNumber) ? parsedNumber : rawValue;
+        }
+
+        return {
+          ...item,
+          check: {
+            ...item.check,
+            check: {
+              ...checkObject,
+              arguments: {
+                ...argumentsObject,
+                [argumentName]: nextValue,
+              },
+            },
+          },
+        };
+      }),
+    );
+  };
+
+  const getChecksForSave = (): any[] => {
+    const parsedChecks = parseEditedYaml();
+    const parsedEditableChecks = buildEditableGeneratedChecks(
+      parsedChecks,
+      editableChecks,
+    );
+    setEditableChecks(parsedEditableChecks);
+    const selectedChecks = getSelectedGeneratedChecks(parsedEditableChecks);
+    if (selectedChecks.length === 0) {
+      throw new Error("Select at least one rule to save.");
+    }
+    return selectedChecks;
   };
 
   const handleConfirmSave = async () => {
     if (!onConfirmSave) return;
 
-    let parsedChecks: any[];
+    let selectedChecks: any[];
     try {
-      parsedChecks = parseEditedYaml();
+      selectedChecks = getChecksForSave();
     } catch (error) {
       const detail = (error as Error).message || "Please fix the YAML and try again.";
       toast.error(`Failed to parse YAML: ${detail}`);
@@ -97,7 +240,7 @@ export function AICheckGenerator({
 
     try {
       setIsSaving(true);
-      await onConfirmSave(parsedChecks);
+      await onConfirmSave(selectedChecks);
       toast.success("Generated checks saved successfully!");
     } catch (error) {
       const detail =
@@ -124,6 +267,16 @@ export function AICheckGenerator({
       e.preventDefault();
       handleGenerate();
     }
+  };
+
+  const renderArgumentValue = (value: unknown) => {
+    if (Array.isArray(value)) {
+      return value.join(", ");
+    }
+    if (value && typeof value === "object") {
+      return JSON.stringify(value);
+    }
+    return String(value ?? "");
   };
 
   return (
@@ -164,7 +317,7 @@ export function AICheckGenerator({
         </div>
       )}
 
-      {/* Generated YAML Output */}
+      {/* Generated Rules Output */}
       <div className="flex-1 mb-4 overflow-hidden">
         <AnimatePresence mode="wait">
           {generatedYaml ? (
@@ -176,11 +329,32 @@ export function AICheckGenerator({
               transition={{ duration: 0.3 }}
               className="h-full flex flex-col"
             >
-              <div className="flex items-center justify-between mb-2">
-                <h3 className="text-sm font-semibold text-muted-foreground">
-                  Editable YAML
-                </h3>
+              <div className="flex items-center justify-between mb-2 gap-3 flex-wrap">
+                <div>
+                  <h3 className="text-sm font-semibold text-muted-foreground">
+                    Suggested Rules
+                  </h3>
+                  <p className="text-xs text-muted-foreground">
+                    {selectedCount} of {totalCount} rules selected for save
+                  </p>
+                </div>
                 <div className="flex items-center gap-2">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => handleSelectAll(true)}
+                    disabled={isSaving || isGenerating}
+                  >
+                    Select All
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => handleSelectAll(false)}
+                    disabled={isSaving || isGenerating}
+                  >
+                    Clear All
+                  </Button>
                   {onConfirmSave && (
                     <Button
                       size="sm"
@@ -193,7 +367,7 @@ export function AICheckGenerator({
                           Saving...
                         </>
                       ) : (
-                        "Confirm & Save"
+                        `Save Selected (${selectedCount})`
                       )}
                     </Button>
                   )}
@@ -217,13 +391,183 @@ export function AICheckGenerator({
                   </Button>
                 </div>
               </div>
-              <Card className="flex-1 overflow-auto p-4 bg-card/50 backdrop-blur-sm">
-                <Textarea
-                  value={generatedYaml}
-                  onChange={(e) => setGeneratedYaml(e.target.value)}
-                  className="min-h-[420px] h-full resize-none border-0 bg-transparent p-0 text-xs font-mono shadow-none focus-visible:ring-0"
-                />
-              </Card>
+              <div className="grid gap-4 lg:grid-cols-[minmax(0,1.25fr)_minmax(0,0.95fr)] min-h-0 flex-1">
+                <Card className="flex min-h-[420px] flex-col overflow-hidden bg-card/50 backdrop-blur-sm">
+                  <div className="border-b px-4 py-3">
+                    <h4 className="text-sm font-medium">Rule List</h4>
+                    <p className="text-xs text-muted-foreground">
+                      Uncheck rules to skip them during save. Edit threshold values directly here.
+                    </p>
+                  </div>
+                  <div className="flex-1 overflow-auto p-4">
+                    <div className="space-y-3">
+                      {editableChecks.map((item, index) => {
+                        const checkObject =
+                          item.check.check && typeof item.check.check === "object"
+                            ? item.check.check
+                            : {};
+                        const argumentsObject =
+                          checkObject.arguments &&
+                          typeof checkObject.arguments === "object"
+                            ? checkObject.arguments
+                            : {};
+                        const functionName = String(checkObject.function ?? "unknown");
+                        const columnName = String(argumentsObject.column ?? "").trim();
+                        const thresholdEntries = Object.entries(argumentsObject).filter(
+                          ([key]) => isEditableThresholdArgument(key),
+                        );
+                        const readOnlyEntries = Object.entries(argumentsObject).filter(
+                          ([key]) =>
+                            key !== "column" && !isEditableThresholdArgument(key),
+                        );
+
+                        return (
+                          <div
+                            key={item.id}
+                            className={`rounded-lg border p-3 transition-colors ${
+                              item.selected
+                                ? "border-primary/30 bg-background"
+                                : "border-border/60 bg-muted/20 opacity-80"
+                            }`}
+                          >
+                            <div className="flex items-start gap-2.5">
+                              <input
+                                type="checkbox"
+                                checked={item.selected}
+                                onChange={(e) =>
+                                  handleToggleSelection(item.id, e.target.checked)
+                                }
+                                className="mt-1.5 h-4 w-4 rounded border-input"
+                              />
+                              <div className="min-w-0 flex-1 space-y-2.5">
+                                <div className="flex items-center gap-2 flex-wrap">
+                                  <Badge variant="outline">Rule {index + 1}</Badge>
+                                  {columnName && (
+                                    <Badge
+                                      variant="outline"
+                                      className="max-w-[16rem] truncate font-mono"
+                                      title={columnName}
+                                    >
+                                      {columnName}
+                                    </Badge>
+                                  )}
+                                  <Badge variant="secondary">{functionName}</Badge>
+                                  {item.check.criticality && (
+                                    <Badge>{String(item.check.criticality)}</Badge>
+                                  )}
+                                </div>
+
+                                <div className="grid gap-2.5">
+                                  <div className="space-y-1">
+                                    <label className="text-xs font-medium text-muted-foreground">
+                                      Name
+                                    </label>
+                                    <Input
+                                      value={String(item.check.name ?? "")}
+                                      onChange={(e) =>
+                                        handleCheckFieldChange(
+                                          item.id,
+                                          "name",
+                                          e.target.value,
+                                        )
+                                      }
+                                      disabled={isSaving || isGenerating}
+                                    />
+                                  </div>
+
+                                  <div className="space-y-1">
+                                    <label className="text-xs font-medium text-muted-foreground">
+                                      Description
+                                    </label>
+                                    <Input
+                                      value={String(item.check.description ?? "")}
+                                      onChange={(e) =>
+                                        handleCheckFieldChange(
+                                          item.id,
+                                          "description",
+                                          e.target.value,
+                                        )
+                                      }
+                                      disabled={isSaving || isGenerating}
+                                    />
+                                  </div>
+
+                                  {thresholdEntries.length > 0 && (
+                                    <div className="grid gap-3 md:grid-cols-3">
+                                      {thresholdEntries.map(([key, value]) => (
+                                        <div key={key} className="space-y-1">
+                                          <label className="text-xs font-medium text-muted-foreground">
+                                            {key}
+                                          </label>
+                                          <Input
+                                            value={String(value ?? "")}
+                                            onChange={(e) =>
+                                              handleThresholdArgumentChange(
+                                                item.id,
+                                                key,
+                                                e.target.value,
+                                              )
+                                            }
+                                            disabled={isSaving || isGenerating}
+                                          />
+                                        </div>
+                                      ))}
+                                    </div>
+                                  )}
+
+                                  {readOnlyEntries.length > 0 && (
+                                    <div className="space-y-2">
+                                      <p className="text-xs font-medium text-muted-foreground">
+                                        Other Arguments
+                                      </p>
+                                      <div className="grid gap-2 md:grid-cols-2">
+                                        {readOnlyEntries.map(([key, value]) => (
+                                          <div
+                                            key={key}
+                                            className="rounded-md border bg-muted/30 px-3 py-2 text-xs"
+                                          >
+                                            <div className="font-medium text-muted-foreground">
+                                              {key}
+                                            </div>
+                                            <div className="mt-1 break-words">
+                                              {renderArgumentValue(value)}
+                                            </div>
+                                          </div>
+                                        ))}
+                                      </div>
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </Card>
+
+                <Card className="flex min-h-[420px] flex-col overflow-hidden bg-card/50 backdrop-blur-sm">
+                  <div className="border-b px-4 py-3">
+                    <h4 className="text-sm font-medium">Editable YAML</h4>
+                    <p className="text-xs text-muted-foreground">
+                      Manual YAML edits update the rule list when the YAML is valid.
+                    </p>
+                  </div>
+                  <div className="flex-1 p-4">
+                    <Textarea
+                      value={generatedYaml}
+                      onChange={(e) => handleYamlChange(e.target.value)}
+                      className="min-h-[420px] h-full resize-none border-0 bg-transparent p-0 text-xs font-mono shadow-none focus-visible:ring-0"
+                    />
+                    {yamlError && (
+                      <p className="mt-3 text-xs text-destructive">
+                        YAML parse error: {yamlError}
+                      </p>
+                    )}
+                  </div>
+                </Card>
+              </div>
             </motion.div>
           ) : (
             <motion.div
