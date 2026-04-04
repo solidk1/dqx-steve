@@ -291,6 +291,76 @@ class TestGetGenerator:
 
 
 class TestUserScopedCatalogOperations:
+    def test_prepare_generated_checks_for_display_adds_concise_chinese_description(self):
+        checks = [
+            {
+                "name": "id_is_null",
+                "check": {"function": "is_not_null", "arguments": {"column": "id"}},
+                "criticality": "error",
+            }
+        ]
+
+        prepared = backend_router._prepare_generated_checks_for_display(checks)
+
+        assert list(prepared[0].keys())[:2] == ["name", "description"]
+        assert prepared[0]["description"] == "检查列id不能为空，避免缺失值。"
+
+    def test_prepare_generated_checks_for_display_adds_generated_name_when_missing(self):
+        checks = [
+            {
+                "check": {"function": "is_not_null", "arguments": {"column": "id"}},
+                "criticality": "error",
+            }
+        ]
+
+        prepared = backend_router._prepare_generated_checks_for_display(checks)
+
+        assert prepared[0]["name"] == "id_is_null"
+        assert prepared[0]["description"] == "检查列id不能为空，避免缺失值。"
+
+    def test_prepare_generated_checks_for_display_omits_explicit_range_values_in_description(self):
+        checks = [
+            {
+                "name": "amount_isnt_in_range",
+                "check": {
+                    "function": "is_in_range",
+                    "arguments": {"column": "amount", "min_limit": 471.0, "max_limit": 11651.076107197438},
+                },
+                "criticality": "error",
+            }
+        ]
+
+        prepared = backend_router._prepare_generated_checks_for_display(checks)
+
+        assert prepared[0]["description"] == "检查列amount取值应在合理范围内，避免异常值。"
+
+    def test_adjust_profile_based_range_checks_uses_robust_numeric_bounds(self):
+        checks = [
+            {
+                "name": "ask_price_isnt_in_range",
+                "check": {
+                    "function": "is_in_range",
+                    "arguments": {"column": "ask_price", "min_limit": 471.0, "max_limit": 11651.076107197438},
+                },
+                "criticality": "error",
+            }
+        ]
+
+        adjusted = backend_router._adjust_profile_based_range_checks(
+            checks,
+            {
+                "ask_price": {
+                    "min": 471.0,
+                    "max": 11651.076107197438,
+                    "mean": 6000.0,
+                    "stddev": 1800.0,
+                }
+            },
+        )
+
+        assert adjusted[0]["check"]["arguments"]["min_limit"] == 0
+        assert adjusted[0]["check"]["arguments"]["max_limit"] == 12000
+
     def test_get_check_error_rows_returns_empty_when_spark_cannot_resolve_result_table(
         self, mock_workspace_client
     ):
@@ -386,6 +456,59 @@ class TestUserScopedCatalogOperations:
         statement = mock_workspace_client.statement_execution.execute_statement.call_args.kwargs["statement"]
         assert "'databricks-claude-sonnet-4-6'" in statement
         assert "'databricks/databricks-claude-sonnet-4-6'" not in statement
+
+    def test_ai_save_enrichment_batches_large_requests(self, mock_workspace_client, monkeypatch):
+        monkeypatch.setattr(backend_router, "_AI_METADATA_ENRICHMENT_BATCH_SIZE", 2)
+        mock_workspace_client.statement_execution.execute_statement.side_effect = [
+            sql_service.StatementResponse(
+                status=sql_service.StatementStatus(state=sql_service.StatementState.SUCCEEDED),
+                manifest=sql_service.ResultManifest(
+                    schema=sql_service.ResultSchema(
+                        columns=[
+                            sql_service.ColumnInfo(name="idx"),
+                            sql_service.ColumnInfo(name="generated_json"),
+                        ]
+                    )
+                ),
+                result=sql_service.ResultData(
+                    data_array=[
+                        ["0", '{"name":"rule_0","description":"desc 0"}'],
+                        ["1", '{"name":"rule_1","description":"desc 1"}'],
+                    ]
+                ),
+            ),
+            sql_service.StatementResponse(
+                status=sql_service.StatementStatus(state=sql_service.StatementState.SUCCEEDED),
+                manifest=sql_service.ResultManifest(
+                    schema=sql_service.ResultSchema(
+                        columns=[
+                            sql_service.ColumnInfo(name="idx"),
+                            sql_service.ColumnInfo(name="generated_json"),
+                        ]
+                    )
+                ),
+                result=sql_service.ResultData(
+                    data_array=[
+                        ["2", '{"name":"rule_2","description":"desc 2"}'],
+                    ]
+                ),
+            ),
+        ]
+
+        enriched_checks = backend_router._enrich_generated_checks_with_ai_via_sql_warehouse(
+            obo_ws=mock_workspace_client,
+            warehouse_id="wh-123",
+            checks=[
+                {"check": {"function": "is_not_null", "arguments": {"column": "c0"}}, "criticality": "error"},
+                {"check": {"function": "is_not_null", "arguments": {"column": "c1"}}, "criticality": "error"},
+                {"check": {"function": "is_not_null", "arguments": {"column": "c2"}}, "criticality": "error"},
+            ],
+            run_config_name="default",
+        )
+
+        assert [check["name"] for check in enriched_checks] == ["rule_0", "rule_1", "rule_2"]
+        assert [check["description"] for check in enriched_checks] == ["desc 0", "desc 1", "desc 2"]
+        assert mock_workspace_client.statement_execution.execute_statement.call_count == 2
 
     def test_list_catalogs_uses_obo_workspace_client_rest_api(self, mock_workspace_client):
         mock_workspace_client.catalogs.list.return_value = [
@@ -676,7 +799,12 @@ class TestUserScopedCatalogOperations:
             )
             assert response.status_code == 200
             assert response.json()["checks"] == [
-                {"check": {"function": "is_not_null", "arguments": {"column": "id"}}, "criticality": "error"}
+                {
+                    "name": "id_is_null",
+                    "description": "检查列id不能为空，避免缺失值。",
+                    "check": {"function": "is_not_null", "arguments": {"column": "id"}},
+                    "criticality": "error",
+                }
             ]
             assert captured["input_config"] is None
             assert "Selected table: main.analytics.orders" in captured["user_input"]
@@ -773,7 +901,7 @@ class TestUserScopedCatalogOperations:
                 or (
                     {
                         "id": {"count": 100, "count_null": 0},
-                        "amount": {"count": 100, "count_null": 0, "min": 0, "max": 1000},
+                        "amount": {"count": 100, "count_null": 0, "min": 471.0, "max": 11651.076107197438, "mean": 6000.0, "stddev": 1800.0},
                     },
                     [
                         {
@@ -802,21 +930,23 @@ class TestUserScopedCatalogOperations:
             assert response.json()["checks"] == [
                 {
                     "name": "id_is_null",
+                    "description": "检查列id不能为空，避免缺失值。",
                     "check": {"function": "is_not_null", "arguments": {"column": "id"}},
                     "criticality": "error",
                 },
                 {
                     "name": "amount_isnt_in_range",
+                    "description": "检查列amount取值应在合理范围内，避免异常值。",
                     "check": {
                         "function": "is_in_range",
-                        "arguments": {"column": "amount", "min_limit": 0, "max_limit": 1000},
+                        "arguments": {"column": "amount", "min_limit": 0, "max_limit": 12000},
                     },
                     "criticality": "error",
                 },
             ]
             assert captured["summary_stats"] == {
                 "id": {"count": 100, "count_null": 0},
-                "amount": {"count": 100, "count_null": 0, "min": 0, "max": 1000},
+                "amount": {"count": 100, "count_null": 0, "min": 471.0, "max": 11651.076107197438, "mean": 6000.0, "stddev": 1800.0},
             }
             assert captured["input_config"] is None
             assert captured["profile_obo_ws"] is mock_workspace_client
@@ -972,13 +1102,7 @@ class TestUserScopedCatalogOperations:
         monkeypatch.setattr(
             backend_router,
             "_enrich_generated_checks_with_ai_via_sql_warehouse",
-            lambda obo_ws, warehouse_id, checks, run_config_name: [
-                {
-                    **checks[0],
-                    "name": "id_not_null",
-                    "description": "ID must not be null.",
-                }
-            ],
+            lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("save path should not call AI enrichment")),
         )
 
         try:
@@ -988,7 +1112,14 @@ class TestUserScopedCatalogOperations:
                 json={
                     "table_name": "main.analytics.checks",
                     "mode": "append",
-                    "checks": [{"check": {"function": "is_not_null", "arguments": {"column": "id"}}, "criticality": "error"}],
+                    "checks": [
+                        {
+                            "name": "id_is_null",
+                            "description": "检查列id不能为空，避免缺失值。",
+                            "check": {"function": "is_not_null", "arguments": {"column": "id"}},
+                            "criticality": "error",
+                        }
+                    ],
                 },
                 headers={"X-Forwarded-Access-Token": "dummy"},
             )
@@ -1029,17 +1160,6 @@ class TestUserScopedCatalogOperations:
             "get_spark",
             lambda _token: (_ for _ in ()).throw(AssertionError("get_spark should not be called")),
         )
-        monkeypatch.setattr(
-            backend_router,
-            "_enrich_generated_checks_with_ai_via_sql_warehouse",
-            lambda obo_ws, warehouse_id, checks, run_config_name: [
-                {
-                    **checks[0],
-                    "name": "stock_code_four_digits",
-                    "description": "Stock code must be exactly four digits.",
-                }
-            ],
-        )
 
         try:
             client = TestClient(app)
@@ -1052,6 +1172,7 @@ class TestUserScopedCatalogOperations:
                     "checks": [
                         {
                             "name": "order_id_required",
+                            "description": "检查列Order ID不能为空，避免缺失值。",
                             "check": {"function": "is_not_null", "arguments": {"column": "\"order id\""}},
                             "criticality": "error",
                         }
@@ -1067,8 +1188,8 @@ class TestUserScopedCatalogOperations:
             assert all(call.kwargs["warehouse_id"] == "wh-123" for call in mock_workspace_client.statement_execution.execute_statement.call_args_list)
             insert_statement = next(statement for statement in statements if "INSERT INTO `main`.`analytics`.`checks`" in statement)
             assert '"Order ID"' in insert_statement
-            assert "'stock_code_four_digits'" in insert_statement
-            assert "'Stock code must be exactly four digits.'" in insert_statement
+            assert "'order_id_required'" in insert_statement
+            assert "'检查列Order ID不能为空，避免缺失值。'" in insert_statement
             assert "rule_fingerprint" not in insert_statement
             assert "rule_set_fingerprint" not in insert_statement
         finally:
@@ -1102,17 +1223,6 @@ class TestUserScopedCatalogOperations:
             "_get_default_warehouse_id",
             lambda _app_ws, _obo_ws, explicit_warehouse_id=None: explicit_warehouse_id or "wh-123",
         )
-        monkeypatch.setattr(
-            backend_router,
-            "_enrich_generated_checks_with_ai_via_sql_warehouse",
-            lambda obo_ws, warehouse_id, checks, run_config_name: [
-                {
-                    **checks[0],
-                    "name": "stock_code_four_digits",
-                    "description": "Stock code must be exactly four digits.",
-                }
-            ],
-        )
 
         try:
             client = TestClient(app)
@@ -1124,6 +1234,8 @@ class TestUserScopedCatalogOperations:
                     "mode": "append",
                     "checks": [
                         {
+                            "name": "stock_code_four_digits",
+                            "description": "检查列stock_code必须是四位数字，避免格式错误。",
                             "check": {"function": "is_not_null", "arguments": {"column": "stock_code"}},
                             "criticality": "error",
                         }

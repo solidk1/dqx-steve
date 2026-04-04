@@ -1,6 +1,8 @@
 import json
+import math
 import os
 import re
+import hashlib
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -152,7 +154,7 @@ def ai_generate_checks(
             user_input = f"{body.user_input}\n\n{_build_table_context_for_ai_generation(obo_ws, app_ws, body.table_name)}"
 
         checks = generator.generate_dq_rules_ai_assisted(user_input=user_input)
-        checks = _normalize_generated_checks(checks)
+        checks = _prepare_generated_checks_for_display(_normalize_generated_checks(checks))
 
         # Convert checks to YAML
         yaml_output = yaml.dump(checks, default_flow_style=False, sort_keys=False, allow_unicode=True)
@@ -197,7 +199,12 @@ def profile_ai_generate_checks(
                 summary_stats=summary_stats,
             )
         )
-        checks = _normalize_generated_checks(_upsert_checks_by_name(profiler_checks, ai_checks))
+        checks = _prepare_generated_checks_for_display(
+            _adjust_profile_based_range_checks(
+                _normalize_generated_checks(_upsert_checks_by_name(profiler_checks, ai_checks)),
+                summary_stats,
+            )
+        )
         yaml_output = yaml.dump(checks, default_flow_style=False, sort_keys=False, allow_unicode=True)
         return GenerateChecksOut(yaml_output=yaml_output, checks=checks)
     except HTTPException:
@@ -211,6 +218,7 @@ def profile_ai_generate_checks(
 
 
 _TABLE_NAME_RE = re.compile(r"^[\w]+\.[\w]+\.[\w]+$")
+_AI_METADATA_ENRICHMENT_BATCH_SIZE = 10
 
 
 def _quote_3part_table_name(full_name: str) -> str:
@@ -279,6 +287,268 @@ def _build_profile_ai_user_input(
     if user_input and user_input.strip():
         prompt_parts.append(f"Additional requirements:\n{user_input.strip()}")
     return "\n\n".join(prompt_parts)
+
+
+def _get_check_target_label(check_item: dict) -> str:
+    check_obj = check_item.get("check") if isinstance(check_item.get("check"), dict) else {}
+    arguments = check_obj.get("arguments") if isinstance(check_obj.get("arguments"), dict) else {}
+
+    column = arguments.get("column")
+    if isinstance(column, str) and column.strip():
+        return column.strip()
+
+    columns = arguments.get("columns")
+    if isinstance(columns, list) and columns:
+        return "、".join(str(column).strip() for column in columns if str(column).strip())
+
+    for_each_columns = check_obj.get("for_each_column")
+    if isinstance(for_each_columns, list) and for_each_columns:
+        return "、".join(str(column).strip() for column in for_each_columns if str(column).strip())
+
+    return "该字段"
+
+
+def _get_check_target_values(check_item: dict) -> list[str]:
+    check_obj = check_item.get("check") if isinstance(check_item.get("check"), dict) else {}
+    arguments = check_obj.get("arguments") if isinstance(check_obj.get("arguments"), dict) else {}
+
+    column = arguments.get("column")
+    if isinstance(column, str) and column.strip():
+        return [column.strip()]
+
+    columns = arguments.get("columns")
+    if isinstance(columns, list):
+        result = [str(item).strip() for item in columns if str(item).strip()]
+        if result:
+            return result
+
+    for_each_columns = check_obj.get("for_each_column")
+    if isinstance(for_each_columns, list):
+        result = [str(item).strip() for item in for_each_columns if str(item).strip()]
+        if result:
+            return result
+
+    return []
+
+
+def _slugify_rule_name_part(value: str) -> str:
+    normalized = _canonical_column_name(value).strip().lower()
+    ascii_only = normalized.encode("ascii", "ignore").decode("ascii")
+    slug = re.sub(r"[^a-z0-9]+", "_", ascii_only).strip("_")
+    if slug and slug[0].isdigit():
+        slug = f"col_{slug}"
+    if slug:
+        return slug
+    digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:8]
+    return f"rule_{digest}"
+
+
+def _truncate_rule_name(name: str) -> str:
+    if len(name) <= 64:
+        return name
+    digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
+    return f"{name[:55].rstrip('_')}_{digest}"
+
+
+def _build_generated_rule_name(check_item: dict) -> str:
+    check_obj = check_item.get("check") if isinstance(check_item.get("check"), dict) else {}
+    function_name = str(check_obj.get("function", "")).strip()
+    target_values = _get_check_target_values(check_item)
+    target_slug = "_".join(_slugify_rule_name_part(value) for value in target_values[:3])
+
+    if function_name == "is_not_null":
+        base_name = f"{target_slug}_is_null" if target_slug else "rule_is_null"
+    elif function_name == "is_not_null_and_not_empty":
+        base_name = f"{target_slug}_is_null_or_empty" if target_slug else "rule_is_null_or_empty"
+    elif function_name == "is_not_empty":
+        base_name = f"{target_slug}_is_not_empty" if target_slug else "rule_is_not_empty"
+    elif function_name == "is_in_range":
+        base_name = f"{target_slug}_isnt_in_range" if target_slug else "rule_isnt_in_range"
+    elif function_name == "is_not_less_than":
+        base_name = f"{target_slug}_not_less_than" if target_slug else "rule_not_less_than"
+    elif function_name == "is_not_greater_than":
+        base_name = f"{target_slug}_not_greater_than" if target_slug else "rule_not_greater_than"
+    elif function_name in {"is_in_list", "is_in"}:
+        base_name = f"{target_slug}_other_value" if target_slug else "rule_other_value"
+    elif function_name == "is_unique":
+        base_name = f"unique_{target_slug}" if target_slug else "unique_rule"
+    else:
+        function_slug = _slugify_rule_name_part(function_name or "rule")
+        base_name = f"{target_slug}_{function_slug}" if target_slug else function_slug
+
+    return _truncate_rule_name(base_name)
+
+
+def _generate_concise_chinese_description(check_item: dict) -> str:
+    check_obj = check_item.get("check") if isinstance(check_item.get("check"), dict) else {}
+    arguments = check_obj.get("arguments") if isinstance(check_obj.get("arguments"), dict) else {}
+    function_name = str(check_obj.get("function", "")).strip()
+    target = _get_check_target_label(check_item)
+
+    if function_name == "is_not_null":
+        return f"检查列{target}不能为空，避免缺失值。"
+    if function_name == "is_not_null_and_not_empty":
+        return f"检查列{target}不能为空或空字符串，避免无效内容。"
+    if function_name == "is_not_empty":
+        return f"检查列{target}不能是空字符串，避免无效内容。"
+    if function_name == "is_in_range":
+        return f"检查列{target}取值应在合理范围内，避免异常值。"
+    if function_name == "is_not_less_than":
+        return f"检查列{target}取值不能小于{arguments.get('limit')}，避免过小异常值。"
+    if function_name == "is_not_greater_than":
+        return f"检查列{target}取值不能大于{arguments.get('limit')}，避免过大异常值。"
+    if function_name in {"is_in_list", "is_in"}:
+        allowed = arguments.get("allowed") or arguments.get("in") or []
+        if isinstance(allowed, list):
+            preview = "、".join(str(item) for item in allowed[:5])
+            if len(allowed) > 5:
+                preview += "等"
+        else:
+            preview = str(allowed)
+        return f"检查列{target}取值应属于{preview}，避免非法枚举值。"
+    if function_name == "is_unique":
+        return f"检查列{target}组合应唯一，避免重复记录。"
+    return f"检查列{target}满足{function_name}规则，保证数据质量。"
+
+
+def _to_numeric_float(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float, Decimal)):
+        return float(value)
+    return None
+
+
+def _round_profile_numeric_limit(value: float, direction: str, span: float, clamp_non_negative: bool) -> int | float:
+    safe_span = max(span, 1.0)
+    magnitude = int(math.floor(math.log10(safe_span))) if safe_span > 0 else 0
+    step = 10 ** max(magnitude - 1, 0)
+
+    if direction == "down":
+        rounded = math.floor(value / step) * step
+    else:
+        rounded = math.ceil(value / step) * step
+
+    if clamp_non_negative:
+        rounded = max(0, rounded)
+
+    if step >= 1:
+        return int(rounded)
+    return rounded
+
+
+def _derive_robust_numeric_range(column_stats: dict[str, object]) -> tuple[int | float, int | float] | None:
+    mean_value = _to_numeric_float(column_stats.get("mean"))
+    stddev_value = _to_numeric_float(column_stats.get("stddev"))
+    min_value = _to_numeric_float(column_stats.get("min"))
+    max_value = _to_numeric_float(column_stats.get("max"))
+
+    if None in {mean_value, stddev_value, min_value, max_value}:
+        return None
+
+    assert mean_value is not None
+    assert stddev_value is not None
+    assert min_value is not None
+    assert max_value is not None
+
+    if stddev_value <= 0 or min_value >= max_value:
+        return None
+
+    lower_bound = mean_value - 3 * stddev_value
+    upper_bound = mean_value + 3 * stddev_value
+    clamp_non_negative = min_value >= 0 and max_value >= 0
+
+    if clamp_non_negative:
+        lower_bound = max(0.0, lower_bound)
+
+    if lower_bound >= upper_bound:
+        return None
+
+    span = max(upper_bound - lower_bound, max_value - min_value, 1.0)
+    rounded_lower = _round_profile_numeric_limit(lower_bound, "down", span, clamp_non_negative)
+    rounded_upper = _round_profile_numeric_limit(upper_bound, "up", span, clamp_non_negative=False)
+
+    if rounded_lower >= rounded_upper:
+        return None
+
+    return rounded_lower, rounded_upper
+
+
+def _adjust_profile_based_range_checks(checks: list[dict], summary_stats: dict[str, object]) -> list[dict]:
+    adjusted_checks: list[dict] = []
+    for check_item in checks:
+        if not isinstance(check_item, dict):
+            adjusted_checks.append(check_item)
+            continue
+
+        check_obj = check_item.get("check") if isinstance(check_item.get("check"), dict) else {}
+        arguments = check_obj.get("arguments") if isinstance(check_obj.get("arguments"), dict) else {}
+        if check_obj.get("function") != "is_in_range":
+            adjusted_checks.append(check_item)
+            continue
+
+        column_name = arguments.get("column")
+        if not isinstance(column_name, str):
+            adjusted_checks.append(check_item)
+            continue
+
+        column_stats = summary_stats.get(column_name)
+        if not isinstance(column_stats, dict):
+            adjusted_checks.append(check_item)
+            continue
+
+        robust_range = _derive_robust_numeric_range(column_stats)
+        if robust_range is None:
+            adjusted_checks.append(check_item)
+            continue
+
+        min_limit, max_limit = robust_range
+        adjusted_checks.append(
+            {
+                **check_item,
+                "check": {
+                    **check_obj,
+                    "arguments": {
+                        **arguments,
+                        "min_limit": min_limit,
+                        "max_limit": max_limit,
+                    },
+                },
+            }
+        )
+    return adjusted_checks
+
+
+def _prepare_generated_checks_for_display(checks: list[dict]) -> list[dict]:
+    prepared_checks: list[dict] = []
+    generated_names_seen: set[str] = set()
+    for check_item in checks:
+        if not isinstance(check_item, dict):
+            prepared_checks.append(check_item)
+            continue
+
+        description = str(check_item.get("description", "")).strip()
+        name = str(check_item.get("name", "")).strip()
+        if not name:
+            generated_name = _build_generated_rule_name(check_item)
+            candidate_name = generated_name
+            suffix = 2
+            while candidate_name in generated_names_seen:
+                candidate_name = _truncate_rule_name(f"{generated_name}_{suffix}")
+                suffix += 1
+            name = candidate_name
+        generated_names_seen.add(name)
+        prepared = {}
+        prepared["name"] = name
+        prepared["description"] = description or _generate_concise_chinese_description(check_item)
+        for key in ("criticality", "check", "filter", "user_metadata"):
+            if key in check_item:
+                prepared[key] = check_item[key]
+        for key, value in check_item.items():
+            if key not in prepared:
+                prepared[key] = value
+        prepared_checks.append(prepared)
+    return prepared_checks
 
 
 def _parse_sql_value_for_profile(value: str | None, type_text: str | None) -> object | None:
@@ -601,6 +871,12 @@ def _sql_ai_query_endpoint_name() -> str:
     return model_name.removeprefix("databricks/") if model_name else model_name
 
 
+def _chunk_sequence(items: list[tuple[int, dict]], size: int) -> list[list[tuple[int, dict]]]:
+    if size <= 0:
+        return [items]
+    return [items[index : index + size] for index in range(0, len(items), size)]
+
+
 def _enrich_generated_checks_with_ai_via_sql_warehouse(
     obo_ws: WorkspaceClient,
     warehouse_id: str,
@@ -616,31 +892,32 @@ def _enrich_generated_checks_with_ai_via_sql_warehouse(
     if not checks_to_enrich:
         return checks
 
-    values_sql = ", ".join(
-        f"({index}, {_sql_string_literal(_build_generated_rule_metadata_prompt(check, run_config_name))})"
-        for index, check in checks_to_enrich
-    )
-    response = _execute_sql_statement(
-        obo_ws,
-        (
-            "SELECT idx, ai_query("
-            f"{_sql_string_literal(model_name)}, prompt"
-            ") AS generated_json "
-            f"FROM VALUES {values_sql} AS prompts(idx, prompt)"
-        ),
-        warehouse_id,
-    )
-    generated_rows = _statement_rows_to_dicts(response)
     generated_by_index: dict[int, dict[str, object]] = {}
-    for row in generated_rows:
-        row_index = _first_present_value(row, ["idx"])
-        generated_json = _first_present_value(row, ["generated_json", "ai_query(prompt)", "col_1"])
-        if row_index is None or generated_json is None:
-            continue
-        try:
-            generated_by_index[int(row_index)] = _parse_json_object_response(generated_json)
-        except ValueError:
-            continue
+    for check_batch in _chunk_sequence(checks_to_enrich, _AI_METADATA_ENRICHMENT_BATCH_SIZE):
+        values_sql = ", ".join(
+            f"({index}, {_sql_string_literal(_build_generated_rule_metadata_prompt(check, run_config_name))})"
+            for index, check in check_batch
+        )
+        response = _execute_sql_statement(
+            obo_ws,
+            (
+                "SELECT idx, ai_query("
+                f"{_sql_string_literal(model_name)}, prompt"
+                ") AS generated_json "
+                f"FROM VALUES {values_sql} AS prompts(idx, prompt)"
+            ),
+            warehouse_id,
+        )
+        generated_rows = _statement_rows_to_dicts(response)
+        for row in generated_rows:
+            row_index = _first_present_value(row, ["idx"])
+            generated_json = _first_present_value(row, ["generated_json", "ai_query(prompt)", "col_1"])
+            if row_index is None or generated_json is None:
+                continue
+            try:
+                generated_by_index[int(row_index)] = _parse_json_object_response(generated_json)
+            except ValueError:
+                continue
 
     enriched_checks: list[dict] = []
     for index, check in enumerate(checks):
@@ -1430,12 +1707,6 @@ def append_generated_checks(
                 logger.warning(f"Failed to align generated checks to schema for '{run_config_name}'", exc_info=True)
 
         resolved_warehouse_id = _get_default_warehouse_id(app_ws, obo_ws)
-        normalized_checks = _enrich_generated_checks_with_ai_via_sql_warehouse(
-            obo_ws=obo_ws,
-            warehouse_id=resolved_warehouse_id,
-            checks=normalized_checks,
-            run_config_name=run_config_name,
-        )
         duplicate_names_in_batch = _validate_generated_rule_metadata(normalized_checks, run_config_name)
         if duplicate_names_in_batch:
             raise HTTPException(

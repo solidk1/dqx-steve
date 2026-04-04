@@ -5,6 +5,7 @@ import { Card } from "@/components/ui/card";
 import { Loader2, ArrowRight, Copy, Sparkles, Check, Database } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { toast } from "sonner";
+import { load } from "js-yaml";
 
 interface AICheckGeneratorProps {
   onGenerate: (userInput: string) => Promise<{ yaml_output: string; checks: any[] }>;
@@ -23,7 +24,6 @@ export function AICheckGenerator({
 }: AICheckGeneratorProps) {
   const [userInput, setUserInput] = useState("");
   const [generatedYaml, setGeneratedYaml] = useState<string | null>(null);
-  const [generatedChecks, setGeneratedChecks] = useState<any[] | null>(null);
   const [copied, setCopied] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
 
@@ -36,7 +36,6 @@ export function AICheckGenerator({
     try {
       const result = await onGenerate(userInput);
       setGeneratedYaml(result.yaml_output);
-      setGeneratedChecks(result.checks);
       toast.success("Checks generated successfully!");
     } catch (error) {
       console.error("Failed to generate checks:", error);
@@ -54,7 +53,6 @@ export function AICheckGenerator({
     try {
       const result = await onSuggestWholeTable();
       setGeneratedYaml(result.yaml_output);
-      setGeneratedChecks(result.checks);
       toast.success("Profile-based checks generated successfully!");
     } catch (error) {
       console.error("Failed to generate profile-based checks:", error);
@@ -66,8 +64,29 @@ export function AICheckGenerator({
     }
   };
 
+  const parseEditedYaml = (): any[] => {
+    if (!generatedYaml?.trim()) {
+      throw new Error("No generated YAML to save.");
+    }
+
+    const parsed = load(generatedYaml);
+    if (!Array.isArray(parsed)) {
+      throw new Error("Generated YAML must be a list of checks.");
+    }
+    return parsed as any[];
+  };
+
   const handleConfirmSave = async () => {
-    if (!onConfirmSave || !generatedChecks || generatedChecks.length === 0) return;
+    if (!onConfirmSave) return;
+
+    let parsedChecks: any[];
+    try {
+      parsedChecks = parseEditedYaml();
+    } catch (error) {
+      const detail = (error as Error).message || "Please fix the YAML and try again.";
+      toast.error(`Failed to parse YAML: ${detail}`);
+      return;
+    }
 
     const confirmed = window.confirm(
       saveTargetLabel
@@ -78,7 +97,7 @@ export function AICheckGenerator({
 
     try {
       setIsSaving(true);
-      await onConfirmSave(generatedChecks);
+      await onConfirmSave(parsedChecks);
       toast.success("Generated checks saved successfully!");
     } catch (error) {
       const detail =
@@ -159,7 +178,7 @@ export function AICheckGenerator({
             >
               <div className="flex items-center justify-between mb-2">
                 <h3 className="text-sm font-semibold text-muted-foreground">
-                  Generated Checks
+                  Editable YAML
                 </h3>
                 <div className="flex items-center gap-2">
                   {onConfirmSave && (
@@ -199,9 +218,11 @@ export function AICheckGenerator({
                 </div>
               </div>
               <Card className="flex-1 overflow-auto p-4 bg-card/50 backdrop-blur-sm">
-                <pre className="text-xs font-mono whitespace-pre-wrap break-words">
-                  {generatedYaml}
-                </pre>
+                <Textarea
+                  value={generatedYaml}
+                  onChange={(e) => setGeneratedYaml(e.target.value)}
+                  className="min-h-[420px] h-full resize-none border-0 bg-transparent p-0 text-xs font-mono shadow-none focus-visible:ring-0"
+                />
               </Card>
             </motion.div>
           ) : (
