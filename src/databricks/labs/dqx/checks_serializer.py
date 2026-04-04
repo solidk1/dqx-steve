@@ -96,7 +96,7 @@ class JsonSerializer(FileFormatSerializer):
 
     def serialize(self, data: list[dict]) -> str:
         """Serialize data to JSON string."""
-        return json.dumps(data)
+        return json.dumps(data, ensure_ascii=False)
 
     def deserialize(self, file_like: TextIO) -> list[dict]:
         """Deserialize data from JSON file."""
@@ -108,7 +108,7 @@ class YamlSerializer(FileFormatSerializer):
 
     def serialize(self, data: list[dict]) -> str:
         """Serialize data to YAML string."""
-        return yaml.safe_dump(data)
+        return yaml.safe_dump(data, allow_unicode=True)
 
     def deserialize(self, file_like: TextIO) -> list[dict]:
         """Deserialize data from YAML file."""

@@ -231,7 +231,7 @@ class DataFrameConverter:
             check_inner = check.get("check") or {}
             func_args = check_inner.get("arguments") or {}
             # Values are already normalized by ChecksNormalizer.normalize; json.dumps for MAP<STRING, STRING>
-            json_arguments = {k: json.dumps(v) for k, v in func_args.items()}
+            json_arguments = {k: json.dumps(v, ensure_ascii=False) for k, v in func_args.items()}
 
             check_struct = {
                 "function": check_inner.get("function"),

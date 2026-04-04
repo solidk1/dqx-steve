@@ -1933,6 +1933,22 @@ def test_metadata_round_trip_conversion_preserves_rules() -> None:
         ([{"key": "value"}], ".yaml", yaml.safe_dump([{"key": "value"}]).encode("utf-8")),
         ([{"key": "value"}], ".yml", yaml.safe_dump([{"key": "value"}]).encode("utf-8")),
         ([{"key": "value"}], "", yaml.safe_dump([{"key": "value"}]).encode("utf-8")),  # Default to YAML if no extension
+        (
+            [{"check": {"function": "is_not_null", "arguments": {"column": "金额"}}}],
+            ".json",
+            json.dumps(
+                [{"check": {"function": "is_not_null", "arguments": {"column": "金额"}}}],
+                ensure_ascii=False,
+            ).encode("utf-8"),
+        ),
+        (
+            [{"check": {"function": "is_not_null", "arguments": {"column": "金额"}}}],
+            ".yaml",
+            yaml.safe_dump(
+                [{"check": {"function": "is_not_null", "arguments": {"column": "金额"}}}],
+                allow_unicode=True,
+            ).encode("utf-8"),
+        ),
     ],
 )
 def test_serialize_checks_to_bytes(checks, file_path_suffix, expected_output):

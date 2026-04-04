@@ -286,3 +286,15 @@ def test_to_dataframe_all_rows_share_same_created_at():
     rows = spark.createDataFrame.call_args.args[0]
     assert len(rows) == 2
     assert rows[0][6] == rows[1][6] == _FIXED_TS
+
+
+def test_to_dataframe_preserves_unicode_argument_values():
+    """Unicode column names remain literal when serialized into MAP<STRING, STRING> arguments."""
+    spark = create_autospec(SparkSession)
+    unicode_checks = [{"criticality": "error", "check": {"function": "is_not_null", "arguments": {"column": "金额"}}}]
+
+    DataFrameConverter.to_dataframe(spark, unicode_checks, created_at=_FIXED_TS)
+
+    rows = spark.createDataFrame.call_args.args[0]
+    check_struct = rows[0][2]
+    assert check_struct["arguments"]["column"] == '"金额"'
