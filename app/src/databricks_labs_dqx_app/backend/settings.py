@@ -1,5 +1,4 @@
 import base64
-
 import yaml
 from databricks.labs.dqx.config import WorkspaceConfig
 from databricks.labs.dqx.config_serializer import ConfigSerializer
@@ -12,24 +11,22 @@ from .models import InstallationSettings
 
 
 class SettingsManager:
-    def __init__(self, ws: WorkspaceClient, user_name: str | None = None):
+    def __init__(self, ws: WorkspaceClient):
         """
         Args:
             ws: WorkspaceClient used for file operations (mkdirs, upload, export).
-            user_name: The workspace username whose home folder hosts settings.
-                       If not provided, falls back to ws.current_user.me().
         """
         self.ws = ws
-        if user_name:
-            self.user_name = user_name
-        else:
-            self.user_name = ws.current_user.me().user_name
+        self.user_name = ws.current_user.me().user_name
         self.user_home = f"/Users/{self.user_name}"
         self.default_dqx_folder = f"{self.user_home}/.dqx"
         self.app_settings_path = f"{self.default_dqx_folder}/app.yml"
 
     def get_default_install_folder(self) -> str:
         return self.default_dqx_folder
+
+    def _default_settings(self) -> InstallationSettings:
+        return InstallationSettings(install_folder=self.get_default_install_folder())
 
     def get_settings(self) -> InstallationSettings:
         """Read app settings from app.yml.
@@ -42,16 +39,20 @@ class SettingsManager:
             if resp.content:
                 decoded = base64.b64decode(resp.content).decode("utf-8")
                 data = yaml.safe_load(decoded)
-                if data and "install_folder" in data:
-                    install_folder = data["install_folder"]
-                    return InstallationSettings(install_folder=install_folder)
+                if isinstance(data, dict):
+                    normalized_data = {"install_folder": self.get_default_install_folder(), **data}
+                    return InstallationSettings(**normalized_data)
         except ResourceDoesNotExist:
-            pass
+            logger.info(f"Settings file not found at {self.app_settings_path}, creating defaults")
+            try:
+                return self.save_settings(self._default_settings())
+            except ValueError as e:
+                logger.warning(f"Failed to initialize app settings at {self.app_settings_path}: {e}")
         except Exception as e:
             logger.warning(f"Failed to read app settings from {self.app_settings_path}: {e}")
 
         # Return default if not found or error
-        return InstallationSettings(install_folder=self.get_default_install_folder())
+        return self._default_settings()
 
     def save_settings(self, settings: InstallationSettings) -> InstallationSettings:
         """Save app settings to app.yml and ensure default config exists.
@@ -65,12 +66,13 @@ class SettingsManager:
         The config.yml file stores the actual DQX configuration (run configs, checks, etc.).
         """
         install_folder = settings.install_folder.strip()
+        normalized_settings = settings.model_copy(update={"install_folder": install_folder})
 
         try:
             self.ws.workspace.mkdirs(self.default_dqx_folder)
         except Exception as e:
-            logger.error(f"Failed to create .dqx folder {self.default_dqx_folder}: {e}")
-            raise ValueError(f"Could not create .dqx folder: {self.default_dqx_folder}") from e
+            logger.error(f"Failed to create settings folder {self.default_dqx_folder}: {e}")
+            raise ValueError(f"Could not create settings folder: {self.default_dqx_folder}") from e
 
         if install_folder != self.default_dqx_folder:
             try:
@@ -79,7 +81,7 @@ class SettingsManager:
                 logger.error(f"Failed to create install folder {install_folder}: {e}")
                 raise ValueError(f"Could not create install folder: {install_folder}") from e
 
-        content = yaml.dump({"install_folder": install_folder})
+        content = yaml.dump(normalized_settings.model_dump(mode="json"))
         content_bytes = content.encode("utf-8")
 
         try:
@@ -92,7 +94,7 @@ class SettingsManager:
         # Create default config.yml if it doesn't exist
         self._ensure_default_config_exists(install_folder)
 
-        return InstallationSettings(install_folder=install_folder)
+        return normalized_settings
 
     def _ensure_default_config_exists(self, install_folder: str) -> None:
         """Create a default config.yml in the install folder if it doesn't exist.

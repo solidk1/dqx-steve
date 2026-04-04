@@ -1,29 +1,30 @@
-import re
 import json
+import os
+import re
+from datetime import date, datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Annotated
 
 import yaml
 from databricks.labs.blueprint.installation import Installation
+from databricks.labs.dqx.checks_serializer import ChecksNormalizer
+from databricks.labs.dqx.config import WorkspaceConfig
 from databricks.labs.dqx.profiler.generator import DQGenerator
-from databricks.labs.dqx.config import (
-    InputConfig,
-    TableChecksStorageConfig,
-    WorkspaceConfig,
-)
+from databricks.labs.dqx.profiler.profiler import DQProfiler
 from databricks.labs.dqx.config_serializer import ConfigSerializer
 from databricks.labs.dqx.engine import DQEngine
 from databricks.labs.dqx.errors import InvalidConfigError
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.errors import NotFound, PermissionDenied, ResourceDoesNotExist
-from databricks.sdk.service import compute, jobs
+from databricks.sdk.service import compute, jobs, sql as sql_service
 from databricks.sdk.service.iam import User as UserOut
 from databricks.sdk.service.workspace import ImportFormat
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pyspark.sql import SparkSession
 
 from .config import conf
-from .dependencies import get_app_spark, get_app_ws, get_generator, get_obo_ws
+from .dependencies import _get_llm_model_config, _is_session_changed_error, get_app_ws, get_generator, get_obo_ws, get_spark
 from .logger import logger
 from .models import (
     CheckErrorRowsOut,
@@ -31,13 +32,17 @@ from .models import (
     ChecksIn,
     ChecksOut,
     ChecksTableOut,
+    ClusterInfo,
+    ClustersOut,
     ColumnInfoOut,
     ConfigIn,
     ConfigOut,
+    CreateChecksTableOut,
     DashboardOut,
     GenerateChecksIn,
     GenerateChecksOut,
     InstallationSettings,
+    ProfileGenerateChecksIn,
     RunChecksJobOut,
     SchemasOut,
     SaveGeneratedChecksIn,
@@ -45,6 +50,8 @@ from .models import (
     TableInfoOut,
     TablesOut,
     VersionOut,
+    WarehouseInfo,
+    WarehousesOut,
 )
 from .settings import SettingsManager
 
@@ -93,6 +100,7 @@ def save_settings(
 
 @api.get("/config", response_model=ConfigOut, operation_id="config")
 def get_config(
+    _obo_ws: Annotated[WorkspaceClient, Depends(get_obo_ws)],
     app_ws: Annotated[WorkspaceClient, Depends(get_app_ws)],
     path: str | None = Query(None, description="Path to the configuration folder"),
 ) -> ConfigOut:
@@ -117,6 +125,7 @@ def get_config(
 @api.post("/config", response_model=ConfigOut, operation_id="save_config")
 def save_config(
     body: ConfigIn,
+    _obo_ws: Annotated[WorkspaceClient, Depends(get_obo_ws)],
     app_ws: Annotated[WorkspaceClient, Depends(get_app_ws)],
     path: str | None = Query(None, description="Path to the configuration folder"),
 ) -> ConfigOut:
@@ -130,26 +139,19 @@ def save_config(
 def ai_generate_checks(
     body: GenerateChecksIn,
     generator: Annotated[DQGenerator, Depends(get_generator)],
+    obo_ws: Annotated[WorkspaceClient, Depends(get_obo_ws)],
+    app_ws: Annotated[WorkspaceClient, Depends(get_app_ws)],
 ) -> GenerateChecksOut:
     """Generate data quality checks from natural language using AI-assisted generation."""
     try:
         user_input = body.user_input
-        input_config = None
         if body.table_name:
             if not _TABLE_NAME_RE.match(body.table_name):
                 raise HTTPException(status_code=400, detail="table_name must be a 3-part dotted identifier (catalog.schema.table)")
 
-            input_config = InputConfig(location=body.table_name)
-            quoted_table_name = _quote_3part_table_name(body.table_name)
-            sample_rows = [row.asDict() for row in generator.spark.sql(f"SELECT * FROM {quoted_table_name} LIMIT 20").collect()]
-            sample_rows_json = json.dumps(sample_rows, default=str, ensure_ascii=False)
-            user_input = (
-                f"{body.user_input}\n\n"
-                f"Selected table: {body.table_name}\n"
-                f"Sample rows (JSON):\n{sample_rows_json}"
-            )
+            user_input = f"{body.user_input}\n\n{_build_table_context_for_ai_generation(obo_ws, app_ws, body.table_name)}"
 
-        checks = generator.generate_dq_rules_ai_assisted(user_input=user_input, input_config=input_config)
+        checks = generator.generate_dq_rules_ai_assisted(user_input=user_input)
         checks = _normalize_generated_checks(checks)
 
         # Convert checks to YAML
@@ -158,7 +160,54 @@ def ai_generate_checks(
         return GenerateChecksOut(yaml_output=yaml_output, checks=checks)
     except Exception as e:
         logger.error(f"Failed to generate checks: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to generate checks: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate checks: {_format_spark_error_message(e)}")
+
+
+@api.post(
+    "/profile-ai-generate-checks",
+    response_model=GenerateChecksOut,
+    operation_id="profile_ai_assisted_checks_generation",
+)
+def profile_ai_generate_checks(
+    body: ProfileGenerateChecksIn,
+    generator: Annotated[DQGenerator, Depends(get_generator)],
+    obo_ws: Annotated[WorkspaceClient, Depends(get_obo_ws)],
+    app_ws: Annotated[WorkspaceClient, Depends(get_app_ws)],
+) -> GenerateChecksOut:
+    """Profile a whole table with DQX and use the profile output to drive AI rule suggestions."""
+    try:
+        if not _TABLE_NAME_RE.match(body.table_name):
+            raise HTTPException(status_code=400, detail="table_name must be a 3-part dotted identifier (catalog.schema.table)")
+
+        table_context = _build_table_context_for_ai_generation(obo_ws, app_ws, body.table_name)
+        summary_stats, profiler_checks = _profile_table_for_ai_generation(
+            obo_ws=obo_ws,
+            app_ws=app_ws,
+            generator=generator,
+            table_name=body.table_name,
+        )
+        ai_checks = _normalize_generated_checks(
+            generator.generate_dq_rules_ai_assisted(
+                user_input=_build_profile_ai_user_input(
+                    table_name=body.table_name,
+                    table_context=table_context,
+                    profiler_checks=profiler_checks,
+                    user_input=body.user_input,
+                ),
+                summary_stats=summary_stats,
+            )
+        )
+        checks = _normalize_generated_checks(_upsert_checks_by_name(profiler_checks, ai_checks))
+        yaml_output = yaml.dump(checks, default_flow_style=False, sort_keys=False, allow_unicode=True)
+        return GenerateChecksOut(yaml_output=yaml_output, checks=checks)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to generate profile-based checks: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to generate profile-based checks: {_format_spark_error_message(e)}",
+        )
 
 
 _TABLE_NAME_RE = re.compile(r"^[\w]+\.[\w]+\.[\w]+$")
@@ -167,6 +216,141 @@ _TABLE_NAME_RE = re.compile(r"^[\w]+\.[\w]+\.[\w]+$")
 def _quote_3part_table_name(full_name: str) -> str:
     parts = full_name.split(".")
     return ".".join(f"`{p}`" for p in parts)
+
+
+def _build_table_context_for_ai_generation(
+    obo_ws: WorkspaceClient,
+    app_ws: WorkspaceClient,
+    full_name: str,
+) -> str:
+    table_info = obo_ws.tables.get(full_name=full_name)
+    schema_json = json.dumps(
+        [
+            {
+                "name": column.name,
+                "type": getattr(column, "type_text", None) or getattr(column, "type_name", None),
+                "comment": getattr(column, "comment", None),
+                "nullable": getattr(column, "nullable", True),
+            }
+            for column in (table_info.columns or [])
+            if getattr(column, "name", None)
+        ],
+        default=str,
+        ensure_ascii=False,
+    )
+
+    context_parts = [
+        f"Selected table: {full_name}",
+        f"Table schema (JSON):\n{schema_json}",
+    ]
+
+    try:
+        warehouse_id = _get_default_warehouse_id(app_ws, obo_ws)
+        sample_rows_response = _execute_sql_statement(
+            obo_ws,
+            f"SELECT * FROM {_quote_3part_table_name(full_name)} LIMIT 20",
+            warehouse_id,
+        )
+        sample_rows = _statement_rows_to_dicts(sample_rows_response)
+        if sample_rows:
+            context_parts.append(f"Sample rows (JSON):\n{json.dumps(sample_rows, default=str, ensure_ascii=False)}")
+    except HTTPException as e:
+        if e.status_code != 400:
+            raise
+        logger.info("Skipping sample rows for AI generation because no default warehouse is configured")
+    except Exception:
+        logger.warning("Failed to load sample rows for AI generation", exc_info=True)
+
+    return "\n\n".join(context_parts)
+
+
+def _build_profile_ai_user_input(
+    table_name: str,
+    table_context: str,
+    profiler_checks: list[dict],
+    user_input: str | None = None,
+) -> str:
+    prompt_parts = [
+        f"Suggest a fuller set of data quality rules for the whole table `{table_name}`.",
+        "Use the table context, profiler-suggested checks, and summary statistics to expand coverage while avoiding duplicate rules.",
+        table_context,
+        f"Profiler-suggested checks (JSON):\n{json.dumps(profiler_checks, default=str, ensure_ascii=False)}",
+    ]
+    if user_input and user_input.strip():
+        prompt_parts.append(f"Additional requirements:\n{user_input.strip()}")
+    return "\n\n".join(prompt_parts)
+
+
+def _parse_sql_value_for_profile(value: str | None, type_text: str | None) -> object | None:
+    if value is None:
+        return None
+    if not type_text:
+        return value
+
+    normalized_type = type_text.strip().lower()
+    try:
+        if normalized_type.startswith(("tinyint", "smallint", "int", "bigint", "long")):
+            return int(value)
+        if normalized_type.startswith(("float", "double", "real")):
+            return float(value)
+        if normalized_type.startswith("decimal"):
+            return Decimal(value)
+        if normalized_type.startswith("boolean"):
+            return value.strip().lower() == "true"
+        if normalized_type.startswith("date"):
+            return date.fromisoformat(value)
+        if normalized_type.startswith("timestamp"):
+            return datetime.fromisoformat(value.replace("Z", "+00:00").replace(" ", "T"))
+    except (ValueError, ArithmeticError):
+        return value
+    return value
+
+
+def _profile_table_for_ai_generation(
+    obo_ws: WorkspaceClient,
+    app_ws: WorkspaceClient,
+    generator: DQGenerator,
+    table_name: str,
+) -> tuple[dict, list[dict]]:
+    table_info = obo_ws.tables.get(full_name=table_name)
+    warehouse_id = _get_default_warehouse_id(app_ws, obo_ws)
+    profile_limit = int(DQProfiler.default_profile_options.get("limit", 1000))
+    sample_response = _execute_sql_statement(
+        obo_ws,
+        f"SELECT * FROM {_quote_3part_table_name(table_name)} LIMIT {profile_limit}",
+        warehouse_id,
+    )
+    sample_rows = _statement_rows_to_dicts(sample_response)
+    if not sample_rows:
+        return {}, []
+
+    typed_rows: list[dict[str, object | None]] = []
+    table_columns = [column for column in (table_info.columns or []) if getattr(column, "name", None)]
+    for row in sample_rows:
+        typed_rows.append(
+            {
+                column.name: _parse_sql_value_for_profile(row.get(column.name), getattr(column, "type_text", None))
+                for column in table_columns
+            }
+        )
+
+    df = generator.spark.createDataFrame(typed_rows)
+    profiler = DQProfiler(
+        workspace_client=app_ws,
+        spark=generator.spark,
+        llm_model_config=_get_llm_model_config(),
+    )
+    summary_stats, profiles = profiler.profile(
+        df=df,
+        options={
+            **DQProfiler.default_profile_options,
+            "sample_fraction": 1.0,
+            "limit": len(typed_rows),
+            "llm_primary_key_detection": False,
+        },
+    )
+    profiler_checks = _normalize_generated_checks(generator.generate_dq_rules(profiles=profiles))
+    return summary_stats, profiler_checks
 
 
 def _sql_string_literal(value: str) -> str:
@@ -202,6 +386,14 @@ def _normalize_column_argument(value: str) -> str:
     return _decode_unicode_escapes(normalized)
 
 
+def _normalize_column_reference(value):
+    if isinstance(value, str):
+        return _canonical_column_name(value)
+    if isinstance(value, list):
+        return [_normalize_column_reference(item) for item in value]
+    return value
+
+
 def _normalize_generated_checks(checks):
     normalized = _decode_unicode_escapes(checks)
     if not isinstance(normalized, list):
@@ -219,7 +411,13 @@ def _normalize_generated_checks(checks):
             if isinstance(arguments, dict):
                 column = arguments.get("column")
                 if isinstance(column, str):
-                    arguments["column"] = _normalize_column_argument(column)
+                    arguments["column"] = _normalize_column_reference(column)
+                columns = arguments.get("columns")
+                if isinstance(columns, list):
+                    arguments["columns"] = _normalize_column_reference(columns)
+            for_each_columns = check_obj.get("for_each_column")
+            if isinstance(for_each_columns, list):
+                check_obj["for_each_column"] = _normalize_column_reference(for_each_columns)
         result.append(check_item)
     return result
 
@@ -243,11 +441,26 @@ def _align_check_columns_with_table_schema(checks, run_config_name: str, spark: 
         # If schema lookup fails, keep original checks and let normal validation handle runtime behavior.
         return checks
 
+    return _align_check_columns_with_actual_schema(checks, actual_columns)
+
+
+def _align_check_columns_with_actual_schema(checks, actual_columns: list[str]):
+    if not isinstance(checks, list):
+        return checks
+
     canonical_to_actual: dict[str, str] = {}
     for actual in actual_columns:
         canonical = _canonical_column_name(actual).casefold()
         if canonical and canonical not in canonical_to_actual:
             canonical_to_actual[canonical] = actual
+
+    def _align_column_value(value):
+        if isinstance(value, str):
+            normalized_value = _canonical_column_name(value)
+            return canonical_to_actual.get(normalized_value.casefold(), normalized_value)
+        if isinstance(value, list):
+            return [_align_column_value(item) for item in value]
+        return value
 
     for check_item in checks:
         if not isinstance(check_item, dict):
@@ -260,15 +473,18 @@ def _align_check_columns_with_table_schema(checks, run_config_name: str, spark: 
             continue
         column = arguments.get("column")
         if not isinstance(column, str):
-            continue
+            column = None
 
-        normalized_column = _canonical_column_name(column)
-        matched = canonical_to_actual.get(normalized_column.casefold())
-        if matched:
-            arguments["column"] = matched
-        else:
-            # Keep normalized value even when no match is found to avoid persisting escaped/quoted artifacts.
-            arguments["column"] = normalized_column
+        if column is not None:
+            arguments["column"] = _align_column_value(column)
+
+        columns = arguments.get("columns")
+        if isinstance(columns, list):
+            arguments["columns"] = _align_column_value(columns)
+
+        for_each_columns = check_obj.get("for_each_column")
+        if isinstance(for_each_columns, list):
+            check_obj["for_each_column"] = _align_column_value(for_each_columns)
 
     return checks
 
@@ -303,15 +519,270 @@ def _upsert_checks_by_name(existing_checks, incoming_checks):
     return merged
 
 
-def _update_missing_descriptions_with_ai(
-    spark: SparkSession,
-    checks_table_name: str,
+def _sql_nullable_string_literal(value: object | None) -> str:
+    if value is None:
+        return "NULL"
+    return _sql_string_literal(str(value))
+
+
+def _sql_timestamp_literal(value: datetime) -> str:
+    effective = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    return f"TIMESTAMP {_sql_string_literal(effective.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M:%S.%f'))}"
+
+
+def _sql_string_array_expr(values: list[str]) -> str:
+    if not values:
+        return "CAST(array() AS ARRAY<STRING>)"
+    return "array(" + ", ".join(_sql_string_literal(str(value)) for value in values) + ")"
+
+
+def _sql_string_map_expr(values: dict[str, str] | None) -> str:
+    if values is None:
+        return "CAST(NULL AS MAP<STRING, STRING>)"
+    if not values:
+        return "CAST(map() AS MAP<STRING, STRING>)"
+    entries: list[str] = []
+    for key, value in values.items():
+        entries.append(_sql_string_literal(key))
+        entries.append(_sql_string_literal(value))
+    return "map(" + ", ".join(entries) + ")"
+
+
+def _sql_check_struct_expr(check_item: dict) -> str:
+    check_obj = check_item.get("check") if isinstance(check_item.get("check"), dict) else {}
+    arguments = check_obj.get("arguments") if isinstance(check_obj.get("arguments"), dict) else {}
+    argument_map = {str(key): json.dumps(value, ensure_ascii=False) for key, value in arguments.items()}
+    for_each_columns = check_obj.get("for_each_column")
+    if not isinstance(for_each_columns, list):
+        for_each_columns = []
+
+    return (
+        "named_struct("
+        f"'function', {_sql_nullable_string_literal(check_obj.get('function'))}, "
+        f"'for_each_column', {_sql_string_array_expr([str(value) for value in for_each_columns])}, "
+        f"'arguments', {_sql_string_map_expr(argument_map)}"
+        ")"
+    )
+
+
+def _parse_json_object_response(value: str) -> dict[str, object]:
+    candidate = value.strip()
+    if candidate.startswith("```"):
+        candidate = re.sub(r"^```(?:json)?\s*|\s*```$", "", candidate, flags=re.DOTALL).strip()
+
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", candidate, re.DOTALL)
+        if not match:
+            return {}
+        try:
+            parsed = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return {}
+
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _build_generated_rule_metadata_prompt(check_item: dict, run_config_name: str) -> str:
+    check_json = json.dumps(check_item, ensure_ascii=False, sort_keys=True)
+    return (
+        "You are a data quality expert. Given a DQ rule, generate a concise stable rule name and a short description. "
+        "Return JSON only with keys name and description. "
+        "The name must be lowercase snake_case, start with a letter, use only letters, digits, and underscores, "
+        "and be at most 64 characters. The description should be one sentence. "
+        f"Run config name: {run_config_name}\n"
+        f"Rule JSON: {check_json}"
+    )
+
+
+def _sql_ai_query_endpoint_name() -> str:
+    model_name = _get_llm_model_config().model_name.strip()
+    return model_name.removeprefix("databricks/") if model_name else model_name
+
+
+def _enrich_generated_checks_with_ai_via_sql_warehouse(
+    obo_ws: WorkspaceClient,
+    warehouse_id: str,
+    checks: list[dict],
     run_config_name: str,
+) -> list[dict]:
+    model_name = _sql_ai_query_endpoint_name()
+    checks_to_enrich = [
+        (index, check)
+        for index, check in enumerate(checks)
+        if not str(check.get("name", "")).strip() or not str(check.get("description", "")).strip()
+    ]
+    if not checks_to_enrich:
+        return checks
+
+    values_sql = ", ".join(
+        f"({index}, {_sql_string_literal(_build_generated_rule_metadata_prompt(check, run_config_name))})"
+        for index, check in checks_to_enrich
+    )
+    response = _execute_sql_statement(
+        obo_ws,
+        (
+            "SELECT idx, ai_query("
+            f"{_sql_string_literal(model_name)}, prompt"
+            ") AS generated_json "
+            f"FROM VALUES {values_sql} AS prompts(idx, prompt)"
+        ),
+        warehouse_id,
+    )
+    generated_rows = _statement_rows_to_dicts(response)
+    generated_by_index: dict[int, dict[str, object]] = {}
+    for row in generated_rows:
+        row_index = _first_present_value(row, ["idx"])
+        generated_json = _first_present_value(row, ["generated_json", "ai_query(prompt)", "col_1"])
+        if row_index is None or generated_json is None:
+            continue
+        try:
+            generated_by_index[int(row_index)] = _parse_json_object_response(generated_json)
+        except ValueError:
+            continue
+
+    enriched_checks: list[dict] = []
+    for index, check in enumerate(checks):
+        enriched = dict(check)
+        generated = generated_by_index.get(index, {})
+        if not str(enriched.get("name", "")).strip():
+            generated_name = str(generated.get("name", "")).strip()
+            if generated_name:
+                enriched["name"] = generated_name
+        if not str(enriched.get("description", "")).strip():
+            generated_description = str(generated.get("description", "")).strip()
+            if generated_description:
+                enriched["description"] = generated_description
+        enriched_checks.append(enriched)
+
+    return enriched_checks
+
+
+def _validate_generated_rule_metadata(checks: list[dict], run_config_name: str) -> list[str]:
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+
+    for check in checks:
+        name = str(check.get("name", "")).strip()
+        description = str(check.get("description", "")).strip()
+        if not name:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to generate a rule name for run_config_name '{run_config_name}'.",
+            )
+        if not description:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to generate a rule description for rule '{name}' in run_config_name '{run_config_name}'.",
+            )
+        if name in seen:
+            duplicates.add(name)
+        seen.add(name)
+
+    return sorted(duplicates)
+
+
+def _existing_rule_names_for_run_config(
+    obo_ws: WorkspaceClient,
+    warehouse_id: str,
+    table_name: str,
+    run_config_name: str,
+    names: list[str],
+) -> list[str]:
+    unique_names = sorted({name.strip() for name in names if name.strip()})
+    if not unique_names:
+        return []
+
+    name_list_sql = ", ".join(_sql_string_literal(name) for name in unique_names)
+    response = _execute_sql_statement(
+        obo_ws,
+        (
+            f"SELECT name FROM {_quote_3part_table_name(table_name)} "
+            f"WHERE run_config_name = {_sql_string_literal(run_config_name)} "
+            f"AND name IN ({name_list_sql})"
+        ),
+        warehouse_id,
+    )
+    rows = _statement_rows_to_dicts(response)
+    return sorted(
+        {
+            value
+            for row in rows
+            for value in [str(_first_present_value(row, ["name"]) or "").strip()]
+            if value
+        }
+    )
+
+
+def _serialize_generated_checks_for_sql(checks: list[dict], run_config_name: str) -> list[str]:
+    normalized_for_serialization = ChecksNormalizer.normalize(checks)
+    created_at = datetime.now(timezone.utc)
+    rows: list[str] = []
+
+    for check in normalized_for_serialization:
+        user_metadata = check.get("user_metadata") if isinstance(check.get("user_metadata"), dict) else None
+        user_metadata_map = (
+            {str(key): str(value) for key, value in user_metadata.items()} if user_metadata is not None else None
+        )
+        rows.append(
+            "("
+            + ", ".join(
+                [
+                    _sql_nullable_string_literal(check.get("name")),
+                    _sql_nullable_string_literal(check.get("description")),
+                    _sql_nullable_string_literal(check.get("criticality", "error")),
+                    _sql_check_struct_expr(check),
+                    _sql_nullable_string_literal(check.get("filter")),
+                    _sql_string_literal(run_config_name),
+                    _sql_string_map_expr(user_metadata_map),
+                    _sql_timestamp_literal(created_at),
+                ]
+            )
+            + ")"
+        )
+
+    return rows
+
+
+def _save_generated_checks_via_sql_warehouse(
+    obo_ws: WorkspaceClient,
+    warehouse_id: str,
+    table_name: str,
+    checks: list[dict],
+    run_config_name: str,
+    mode: str,
 ) -> None:
+    quoted_table_name = _quote_3part_table_name(table_name)
+
+    if mode == "overwrite":
+        _execute_sql_statement(
+            obo_ws,
+            f"DELETE FROM {quoted_table_name} WHERE run_config_name = {_sql_string_literal(run_config_name)}",
+            warehouse_id,
+        )
+
+    row_sql = _serialize_generated_checks_for_sql(checks, run_config_name)
+    if not row_sql:
+        return
+
+    _execute_sql_statement(
+        obo_ws,
+        (
+            f"INSERT INTO {quoted_table_name} "
+            "(`name`, `description`, `criticality`, `check`, `filter`, `run_config_name`, "
+            "`user_metadata`, `created_at`) VALUES "
+            + ", ".join(row_sql)
+        ),
+        warehouse_id,
+    )
+
+
+def _missing_description_backfill_sql(checks_table_name: str, run_config_name: str, model_name: str) -> str:
     quoted_table_name = _quote_3part_table_name(checks_table_name)
     run_config_literal = _sql_string_literal(run_config_name)
-    spark.sql(
-        f"""
+    model_name_literal = _sql_string_literal(model_name)
+    return f"""
         MERGE INTO {quoted_table_name} AS target
         USING (
           SELECT
@@ -321,7 +792,7 @@ def _update_missing_descriptions_with_ai(
             to_json(`check`) AS `check_json`,
             CAST(`filter` AS STRING) AS `filter_text`,
             ai_query(
-              'databricks-claude-sonnet-4-6',
+              {model_name_literal},
               concat(
                 '你是一个数据质量专家。请根据以下数据质量检查规则',
                 ', 检查参数: ', to_json(`check`),
@@ -342,6 +813,36 @@ def _update_missing_descriptions_with_ai(
         WHEN MATCHED THEN
           UPDATE SET target.`description` = source.`generated_description`
         """
+
+
+def _update_missing_descriptions_with_ai(
+    spark: SparkSession,
+    checks_table_name: str,
+    run_config_name: str,
+) -> None:
+    model_name = _sql_ai_query_endpoint_name()
+    if not model_name:
+        logger.info("Skipping AI description backfill because SERVING_ENDPOINT_NAME is not configured")
+        return
+
+    spark.sql(_missing_description_backfill_sql(checks_table_name, run_config_name, model_name))
+
+
+def _update_missing_descriptions_with_ai_via_sql_warehouse(
+    obo_ws: WorkspaceClient,
+    warehouse_id: str,
+    checks_table_name: str,
+    run_config_name: str,
+) -> None:
+    model_name = _sql_ai_query_endpoint_name()
+    if not model_name:
+        logger.info("Skipping AI description backfill because SERVING_ENDPOINT_NAME is not configured")
+        return
+
+    _execute_sql_statement(
+        obo_ws,
+        _missing_description_backfill_sql(checks_table_name, run_config_name, model_name),
+        warehouse_id,
     )
 
     return None
@@ -356,9 +857,132 @@ def _format_spark_error_message(error: Exception) -> str:
 
     if "[INSUFFICIENT_PERMISSIONS]" in message:
         return f"Insufficient permissions to read data. {message}"
+    if "PERMISSION_DENIED" in message and "USE CATALOG" in message:
+        return f"You do not have permission to use this catalog. {message}"
     if "[TABLE_OR_VIEW_NOT_FOUND]" in message:
         return f"Table not found. {message}"
     return message
+
+
+def _get_user_name(obo_ws: WorkspaceClient) -> str:
+    return obo_ws.current_user.me().user_name
+
+
+def _get_user_settings(app_ws: WorkspaceClient, obo_ws: WorkspaceClient) -> InstallationSettings:
+    return SettingsManager(app_ws).get_settings()
+
+
+def _execute_sql_statement(
+    obo_ws: WorkspaceClient,
+    statement: str,
+    warehouse_id: str,
+    *,
+    catalog: str | None = None,
+    schema: str | None = None,
+) -> sql_service.StatementResponse:
+    response = obo_ws.statement_execution.execute_statement(
+        statement=statement,
+        warehouse_id=warehouse_id,
+        catalog=catalog,
+        schema=schema,
+        wait_timeout="15s",
+        on_wait_timeout=sql_service.ExecuteStatementRequestOnWaitTimeout.CANCEL,
+    )
+    state = response.status.state if response.status else None
+    if state == sql_service.StatementState.SUCCEEDED:
+        return response
+
+    error = response.status.error if response.status else None
+    message = error.message if error and error.message else f"SQL statement failed with state {state}"
+    raise RuntimeError(message)
+
+
+def _statement_rows_to_dicts(response: sql_service.StatementResponse) -> list[dict[str, str | None]]:
+    columns = response.manifest.schema.columns if response.manifest and response.manifest.schema and response.manifest.schema.columns else []
+    headers = [column.name or f"col_{index}" for index, column in enumerate(columns)]
+    rows = response.result.data_array if response.result and response.result.data_array else []
+
+    result: list[dict[str, str | None]] = []
+    for row in rows:
+        padded_row = list(row) + [None] * max(0, len(headers) - len(row))
+        result.append(dict(zip(headers, padded_row, strict=False)))
+    return result
+
+
+def _first_present_value(row: dict[str, str | None], preferred_keys: list[str]) -> str | None:
+    for key in preferred_keys:
+        value = row.get(key)
+        if value:
+            return value
+    for value in row.values():
+        if value:
+            return value
+    return None
+
+
+def _quote_sql_identifier(identifier: str) -> str:
+    escaped = identifier.replace("`", "``")
+    return f"`{escaped}`"
+
+
+def _get_default_warehouse_id(
+    app_ws: WorkspaceClient,
+    obo_ws: WorkspaceClient,
+    explicit_warehouse_id: str | None = None,
+) -> str:
+    if explicit_warehouse_id:
+        return explicit_warehouse_id
+    settings = _get_user_settings(app_ws, obo_ws)
+    if settings.default_warehouse_id:
+        return settings.default_warehouse_id
+    raise HTTPException(
+        status_code=400,
+        detail="Set a default warehouse in Settings before browsing Unity Catalog metadata.",
+    )
+
+
+def _describe_table_via_sql_warehouse(
+    obo_ws: WorkspaceClient,
+    warehouse_id: str,
+    full_name: str,
+) -> tuple[list[ColumnInfoOut], dict[str, str]]:
+    response = _execute_sql_statement(
+        obo_ws,
+        f"DESCRIBE TABLE EXTENDED {_quote_3part_table_name(full_name)}",
+        warehouse_id,
+    )
+    rows = _statement_rows_to_dicts(response)
+
+    columns: list[ColumnInfoOut] = []
+    table_metadata: dict[str, str] = {}
+    in_metadata_section = False
+
+    for row in rows:
+        col_name = (row.get("col_name") or "").strip()
+        data_type = (row.get("data_type") or "").strip()
+        comment = row.get("comment")
+
+        if not col_name:
+            continue
+        if col_name.startswith("#"):
+            in_metadata_section = "Detailed Table Information" in col_name
+            continue
+
+        if in_metadata_section:
+            table_metadata[col_name] = data_type
+            continue
+
+        columns.append(
+            ColumnInfoOut(
+                name=col_name,
+                type_text=data_type,
+                comment=comment,
+                nullable=True,
+                position=len(columns),
+            )
+        )
+
+    return columns, table_metadata
 
 
 
@@ -400,10 +1024,15 @@ def get_dashboard(
 
 
 @api.get("/catalogs", response_model=CatalogsOut, operation_id="list_catalogs")
-def list_catalogs(app_ws: Annotated[WorkspaceClient, Depends(get_app_ws)]) -> CatalogsOut:
+def list_catalogs(
+    obo_ws: Annotated[WorkspaceClient, Depends(get_obo_ws)],
+    warehouse_id: str | None = Query(None, description="Optional SQL warehouse ID used for metadata queries"),
+) -> CatalogsOut:
     try:
-        catalogs = [c.name for c in app_ws.catalogs.list() if c.name]
+        catalogs = [c.name for c in obo_ws.catalogs.list() if c.name]
         return CatalogsOut(catalogs=sorted(catalogs))
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Failed to list catalogs: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to list catalogs: {e}")
@@ -411,12 +1040,14 @@ def list_catalogs(app_ws: Annotated[WorkspaceClient, Depends(get_app_ws)]) -> Ca
 
 @api.get("/schemas", response_model=SchemasOut, operation_id="list_schemas")
 def list_schemas(
-    app_ws: Annotated[WorkspaceClient, Depends(get_app_ws)],
+    obo_ws: Annotated[WorkspaceClient, Depends(get_obo_ws)],
     catalog: str = Query(..., description="Catalog name"),
 ) -> SchemasOut:
     try:
-        schemas = [s.name for s in app_ws.schemas.list(catalog_name=catalog) if s.name]
+        schemas = [s.name for s in obo_ws.schemas.list(catalog_name=catalog) if s.name]
         return SchemasOut(schemas=sorted(schemas))
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Failed to list schemas for catalog '{catalog}': {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to list schemas: {e}")
@@ -424,13 +1055,19 @@ def list_schemas(
 
 @api.get("/tables", response_model=TablesOut, operation_id="list_tables")
 def list_tables(
-    app_ws: Annotated[WorkspaceClient, Depends(get_app_ws)],
+    obo_ws: Annotated[WorkspaceClient, Depends(get_obo_ws)],
     catalog: str = Query(..., description="Catalog name"),
     schema: str = Query(..., description="Schema name"),
 ) -> TablesOut:
     try:
-        tables = [t.name for t in app_ws.tables.list(catalog_name=catalog, schema_name=schema) if t.name]
+        tables = [
+            table.name
+            for table in obo_ws.tables.list(catalog_name=catalog, schema_name=schema)
+            if table.name
+        ]
         return TablesOut(tables=sorted(tables))
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Failed to list tables for '{catalog}.{schema}': {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to list tables: {e}")
@@ -438,64 +1075,191 @@ def list_tables(
 
 @api.get("/table-info", response_model=TableInfoOut, operation_id="get_table_info")
 def get_table_info(
+    obo_ws: Annotated[WorkspaceClient, Depends(get_obo_ws)],
     app_ws: Annotated[WorkspaceClient, Depends(get_app_ws)],
-    spark: Annotated[SparkSession, Depends(get_app_spark)],
+    token: Annotated[str | None, Header(alias="X-Forwarded-Access-Token")] = None,
     full_name: str = Query(..., description="Fully qualified table name (catalog.schema.table)"),
+    warehouse_id: str | None = Query(None, description="Optional SQL warehouse ID used for metadata queries"),
 ) -> TableInfoOut:
     if not _TABLE_NAME_RE.match(full_name):
         raise HTTPException(status_code=400, detail="full_name must be a 3-part dotted identifier (catalog.schema.table)")
 
     try:
-        table = app_ws.tables.get(full_name=full_name)
-    except NotFound:
-        raise HTTPException(status_code=404, detail=f"Table '{full_name}' not found")
+        table_info = obo_ws.tables.get(full_name=full_name)
+        columns = [
+            ColumnInfoOut(
+                name=column.name or "",
+                type_text=column.type_text or (column.type_name.value if column.type_name else ""),
+                comment=column.comment,
+                nullable=column.nullable if column.nullable is not None else True,
+                position=column.position,
+            )
+            for column in (table_info.columns or [])
+            if column.name
+        ]
     except Exception as e:
+        if "TABLE_OR_VIEW_NOT_FOUND" in str(e) or isinstance(e, NotFound):
+            raise HTTPException(status_code=404, detail=f"Table '{full_name}' not found")
         logger.error(f"Failed to get table metadata for '{full_name}': {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to get table metadata: {e}")
-
-    columns = []
-    if table.columns:
-        for col in table.columns:
-            columns.append(
-                ColumnInfoOut(
-                    name=col.name or "",
-                    type_text=col.type_text or "",
-                    comment=col.comment,
-                    nullable=col.nullable if col.nullable is not None else True,
-                    position=col.position,
-                )
-            )
 
     sample_data: list[dict] = []
     sample_data_error: str | None = None
     try:
         quoted_full_name = _quote_3part_table_name(full_name)
-        df = spark.sql(f"SELECT * FROM {quoted_full_name} LIMIT 50")
-        sample_data = [row.asDict() for row in df.collect()]
-        for row in sample_data:
-            for k, v in row.items():
-                if v is not None and not isinstance(v, (str, int, float, bool)):
-                    row[k] = str(v)
+        if os.environ.get("DATABRICKS_HOST"):
+            resolved_warehouse_id = _get_default_warehouse_id(app_ws, obo_ws, warehouse_id)
+            sample_response = _execute_sql_statement(
+                obo_ws,
+                f"SELECT * FROM {quoted_full_name} LIMIT 50",
+                resolved_warehouse_id,
+            )
+            sample_data = _statement_rows_to_dicts(sample_response)
+        else:
+            spark = get_spark(token)
+            df = spark.sql(f"SELECT * FROM {quoted_full_name} LIMIT 50")
+            sample_data = [row.asDict() for row in df.collect()]
+            for row in sample_data:
+                for k, v in row.items():
+                    if v is not None and not isinstance(v, (str, int, float, bool)):
+                        row[k] = str(v)
     except Exception as e:
         logger.warning(f"Failed to fetch sample data for '{full_name}': {e}")
         sample_data_error = _format_spark_error_message(e)
 
     return TableInfoOut(
         full_name=full_name,
-        table_type=table.table_type.value if table.table_type else None,
-        data_source_format=table.data_source_format.value if table.data_source_format else None,
-        owner=table.owner,
-        comment=table.comment,
+        table_type=getattr(table_info.table_type, "value", table_info.table_type),
+        data_source_format=getattr(table_info.data_source_format, "value", table_info.data_source_format),
+        owner=table_info.owner,
+        comment=table_info.comment,
         columns=columns,
         sample_data=sample_data,
         sample_data_error=sample_data_error,
     )
 
 
+@api.get("/warehouses", response_model=WarehousesOut, operation_id="list_warehouses")
+def list_warehouses(obo_ws: Annotated[WorkspaceClient, Depends(get_obo_ws)]) -> WarehousesOut:
+    try:
+        result = []
+        for w in obo_ws.warehouses.list():
+            if w.id and w.name:
+                result.append(WarehouseInfo(id=w.id, name=w.name, state=w.state.value if w.state else None))
+        return WarehousesOut(warehouses=result)
+    except Exception as e:
+        logger.error(f"Failed to list warehouses: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to list warehouses: {e}")
+
+
+@api.get("/clusters", response_model=ClustersOut, operation_id="list_clusters")
+def list_clusters(obo_ws: Annotated[WorkspaceClient, Depends(get_obo_ws)]) -> ClustersOut:
+    try:
+        result = []
+        for cluster in obo_ws.clusters.list():
+            if cluster.cluster_id and cluster.cluster_name:
+                result.append(
+                    ClusterInfo(
+                        id=cluster.cluster_id,
+                        name=cluster.cluster_name,
+                        state=cluster.state.value if cluster.state else None,
+                    )
+                )
+        return ClustersOut(clusters=sorted(result, key=lambda cluster: cluster.name.lower()))
+    except Exception as e:
+        logger.error(f"Failed to list classic clusters: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to list clusters: {e}")
+
+
+@api.post("/checks-table/create", response_model=CreateChecksTableOut, operation_id="create_checks_table")
+def create_checks_table(
+    obo_ws: Annotated[WorkspaceClient, Depends(get_obo_ws)],
+    app_ws: Annotated[WorkspaceClient, Depends(get_app_ws)],
+    token: Annotated[str | None, Header(alias="X-Forwarded-Access-Token")] = None,
+    table_name: str = Query(..., description="Fully qualified table name (catalog.schema.table)"),
+    warehouse_id: str | None = Query(None, description="Optional SQL warehouse ID used for table creation"),
+) -> CreateChecksTableOut:
+    if not _TABLE_NAME_RE.match(table_name):
+        raise HTTPException(status_code=400, detail="table_name must be a 3-part dotted identifier (catalog.schema.table)")
+
+    # Check if table already exists
+    try:
+        obo_ws.tables.get(full_name=table_name)
+        return CreateChecksTableOut(table_name=table_name, created=False)
+    except NotFound:
+        pass
+    except Exception as e:
+        logger.error(f"Failed to check table existence '{table_name}': {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to check table existence: {e}")
+
+    quoted = _quote_3part_table_name(table_name)
+    catalog_name, schema_name, _ = table_name.split(".")
+
+    def _create_table(target_spark: SparkSession) -> None:
+        target_spark.sql(
+            f"CREATE TABLE {quoted} ("
+            "name STRING NOT NULL, description STRING, criticality STRING, "
+            "check STRUCT<function: STRING, for_each_column: ARRAY<STRING>, arguments: MAP<STRING, STRING>>, "
+            "filter STRING, run_config_name STRING NOT NULL, user_metadata MAP<STRING, STRING>, "
+            "created_at TIMESTAMP, "
+            "PRIMARY KEY (run_config_name, name) NOT ENFORCED"
+            ") USING DELTA"
+        )
+
+    if os.environ.get("DATABRICKS_HOST"):
+        resolved_warehouse_id = _get_default_warehouse_id(app_ws, obo_ws, warehouse_id)
+
+        create_statement = (
+            f"CREATE TABLE {quoted} ("
+            "name STRING NOT NULL, description STRING, criticality STRING, "
+            "check STRUCT<function: STRING, for_each_column: ARRAY<STRING>, arguments: MAP<STRING, STRING>>, "
+            "filter STRING, run_config_name STRING NOT NULL, user_metadata MAP<STRING, STRING>, "
+            "created_at TIMESTAMP, "
+            "PRIMARY KEY (run_config_name, name) NOT ENFORCED"
+            ") USING DELTA"
+        )
+        try:
+            _execute_sql_statement(
+                obo_ws,
+                create_statement,
+                resolved_warehouse_id,
+                catalog=catalog_name,
+                schema=schema_name,
+            )
+            return CreateChecksTableOut(table_name=table_name, created=True)
+        except Exception as e:
+            logger.error(f"Failed to create checks table '{table_name}' via SQL warehouse: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Failed to create checks table: {e}")
+
+    try:
+        spark = get_spark(token)
+        _create_table(spark)
+        return CreateChecksTableOut(table_name=table_name, created=True)
+    except Exception as e:
+        if _is_session_changed_error(e):
+            logger.warning(f"Spark session became stale while creating checks table '{table_name}', retrying once")
+            try:
+                spark = get_spark(token)
+                _create_table(spark)
+                return CreateChecksTableOut(table_name=table_name, created=True)
+            except Exception as retry_error:
+                logger.error(
+                    f"Failed to create checks table '{table_name}' after refreshing Spark session: {retry_error}",
+                    exc_info=True,
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to create checks table: {_format_spark_error_message(retry_error)}",
+                )
+        logger.error(f"Failed to create checks table '{table_name}': {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to create checks table: {_format_spark_error_message(e)}")
+
+
 @api.get("/checks-table", response_model=ChecksTableOut, operation_id="get_checks_table")
 def get_checks_table(
+    obo_ws: Annotated[WorkspaceClient, Depends(get_obo_ws)],
     app_ws: Annotated[WorkspaceClient, Depends(get_app_ws)],
-    spark: Annotated[SparkSession, Depends(get_app_spark)],
+    token: Annotated[str | None, Header(alias="X-Forwarded-Access-Token")] = None,
     table_name: str = Query("shao_sandbox1.dqx.checks", description="Fully qualified checks table name"),
 ) -> ChecksTableOut:
     if not _TABLE_NAME_RE.match(table_name):
@@ -503,7 +1267,7 @@ def get_checks_table(
 
     try:
         # Handle missing checks table gracefully so UI can still render.
-        app_ws.tables.get(full_name=table_name)
+        obo_ws.tables.get(full_name=table_name)
     except NotFound:
         logger.warning(f"Checks table '{table_name}' not found; returning empty result")
         return ChecksTableOut(rows=[], columns=[])
@@ -513,6 +1277,26 @@ def get_checks_table(
 
     try:
         quoted_table_name = _quote_3part_table_name(table_name)
+
+        if os.environ.get("DATABRICKS_HOST"):
+            resolved_warehouse_id = _get_default_warehouse_id(app_ws, obo_ws)
+            response = _execute_sql_statement(
+                obo_ws,
+                f"SELECT * FROM {quoted_table_name}",
+                resolved_warehouse_id,
+            )
+            rows = _statement_rows_to_dicts(response)
+            columns = list(rows[0].keys()) if rows else [
+                column.name or f"col_{index}"
+                for index, column in enumerate(
+                    response.manifest.schema.columns
+                    if response.manifest and response.manifest.schema and response.manifest.schema.columns
+                    else []
+                )
+            ]
+            return ChecksTableOut(rows=rows, columns=columns)
+
+        spark = get_spark(token)
         df = spark.sql(f"SELECT * FROM {quoted_table_name}")
         columns = df.columns
         rows = []
@@ -533,8 +1317,8 @@ def get_checks_table(
 
 @api.get("/checks-table/error-rows", response_model=CheckErrorRowsOut, operation_id="get_check_error_rows")
 def get_check_error_rows(
-    app_ws: Annotated[WorkspaceClient, Depends(get_app_ws)],
-    spark: Annotated[SparkSession, Depends(get_app_spark)],
+    obo_ws: Annotated[WorkspaceClient, Depends(get_obo_ws)],
+    spark: Annotated[SparkSession, Depends(get_spark)],
     run_config_name: str = Query(..., description="Fully qualified run config input table (catalog.schema.table)"),
     check_name: str = Query(..., description="Check name to filter failing rows for"),
     limit: int = Query(200, ge=1, le=5000, description="Max number of rows to return"),
@@ -551,7 +1335,7 @@ def get_check_error_rows(
     check_name_literal = _sql_string_literal(check_name.strip())
 
     try:
-        app_ws.tables.get(full_name=result_table_name)
+        obo_ws.tables.get(full_name=result_table_name)
     except NotFound:
         logger.warning(f"Result table '{result_table_name}' not found; returning empty result")
         return CheckErrorRowsOut(result_table_name=result_table_name, rows=[], columns=[])
@@ -604,6 +1388,9 @@ def get_check_error_rows(
             rows.append(d)
         return CheckErrorRowsOut(result_table_name=result_table_name, rows=rows, columns=columns)
     except Exception as e:
+        if "TABLE_OR_VIEW_NOT_FOUND" in str(e):
+            logger.warning(f"Result table '{result_table_name}' not found during Spark read; returning empty result")
+            return CheckErrorRowsOut(result_table_name=result_table_name, rows=[], columns=[])
         logger.error(f"Failed to read filtered error rows from '{result_table_name}': {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to read error rows: {e}")
 
@@ -611,14 +1398,14 @@ def get_check_error_rows(
 @api.post("/checks-table/append", response_model=SaveGeneratedChecksOut, operation_id="append_generated_checks")
 def append_generated_checks(
     body: SaveGeneratedChecksIn,
+    obo_ws: Annotated[WorkspaceClient, Depends(get_obo_ws)],
     app_ws: Annotated[WorkspaceClient, Depends(get_app_ws)],
-    spark: Annotated[SparkSession, Depends(get_app_spark)],
 ) -> SaveGeneratedChecksOut:
     if not _TABLE_NAME_RE.match(body.table_name):
         raise HTTPException(status_code=400, detail="table_name must be a 3-part dotted identifier (catalog.schema.table)")
 
     try:
-        app_ws.tables.get(full_name=body.table_name)
+        obo_ws.tables.get(full_name=body.table_name)
     except NotFound:
         raise HTTPException(status_code=404, detail=f"Checks table '{body.table_name}' not found")
     except Exception as e:
@@ -634,41 +1421,57 @@ def append_generated_checks(
             raise HTTPException(status_code=400, detail="mode must be one of: overwrite, append, upsert")
 
         run_config_name = body.run_config_name or "default"
-        normalized_checks = _align_check_columns_with_table_schema(
-            normalized_checks,
-            run_config_name=run_config_name,
-            spark=spark,
-        )
-        engine = DQEngine(workspace_client=app_ws, spark=spark)
-        checks_to_save = normalized_checks
-        save_mode = body.mode
-
-        if body.mode == "upsert":
+        if _TABLE_NAME_RE.match(run_config_name):
             try:
-                existing_checks = engine.load_checks(
-                    TableChecksStorageConfig(
-                        location=body.table_name,
-                        run_config_name=run_config_name,
-                        mode="append",
-                    )
-                )
+                run_config_table = obo_ws.tables.get(full_name=run_config_name)
+                actual_columns = [column.name for column in (run_config_table.columns or []) if column.name]
+                normalized_checks = _align_check_columns_with_actual_schema(normalized_checks, actual_columns)
             except Exception:
-                existing_checks = []
-            checks_to_save = _upsert_checks_by_name(existing_checks, normalized_checks)
-            save_mode = "overwrite"
+                logger.warning(f"Failed to align generated checks to schema for '{run_config_name}'", exc_info=True)
 
-        storage_config = TableChecksStorageConfig(
-            location=body.table_name,
+        resolved_warehouse_id = _get_default_warehouse_id(app_ws, obo_ws)
+        normalized_checks = _enrich_generated_checks_with_ai_via_sql_warehouse(
+            obo_ws=obo_ws,
+            warehouse_id=resolved_warehouse_id,
+            checks=normalized_checks,
             run_config_name=run_config_name,
-            mode=save_mode,
         )
-        engine.save_checks(checks_to_save, config=storage_config)
-        _update_missing_descriptions_with_ai(
-            spark=spark,
-            checks_table_name=body.table_name,
+        duplicate_names_in_batch = _validate_generated_rule_metadata(normalized_checks, run_config_name)
+        if duplicate_names_in_batch:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Duplicate rule names were generated within this save request for run_config_name "
+                    f"'{run_config_name}': {', '.join(duplicate_names_in_batch)}"
+                ),
+            )
+        if body.mode != "overwrite":
+            existing_duplicate_names = _existing_rule_names_for_run_config(
+                obo_ws=obo_ws,
+                warehouse_id=resolved_warehouse_id,
+                table_name=body.table_name,
+                run_config_name=run_config_name,
+                names=[str(check.get("name", "")).strip() for check in normalized_checks],
+            )
+            if existing_duplicate_names:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Duplicate rule names already exist for run_config_name '{run_config_name}': "
+                        f"{', '.join(existing_duplicate_names)}"
+                    ),
+                )
+        _save_generated_checks_via_sql_warehouse(
+            obo_ws=obo_ws,
+            warehouse_id=resolved_warehouse_id,
+            table_name=body.table_name,
+            checks=normalized_checks,
             run_config_name=run_config_name,
+            mode=body.mode,
         )
         return SaveGeneratedChecksOut(inserted=len(normalized_checks))
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Failed to append generated checks to '{body.table_name}': {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to save generated checks: {e}")

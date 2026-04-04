@@ -7,6 +7,8 @@ import {
   useTables,
   useTableInfo,
 } from "@/lib/explorer-api";
+import { useGetSettings } from "@/lib/api";
+import selector from "@/lib/selector";
 import type { ColumnInfoOut } from "@/lib/explorer-api";
 import {
   Card,
@@ -40,6 +42,7 @@ import {
 import { FadeIn } from "@/components/anim/FadeIn";
 import { ShinyText } from "@/components/anim/ShinyText";
 import { AICheckGenerator } from "@/components/AICheckGenerator";
+import { getOptionalChecksTableName } from "@/lib/checks-table";
 
 export const Route = createFileRoute("/_sidebar/explore")({
   component: () => <ExplorePage />,
@@ -47,8 +50,10 @@ export const Route = createFileRoute("/_sidebar/explore")({
 
 function CatalogSchemaTableSelector({
   onLoad,
+  warehouseId,
 }: {
   onLoad: (fullName: string) => void;
+  warehouseId?: string;
 }) {
   const [catalog, setCatalog] = useState<string | undefined>("shao_sandbox1");
   const [schema, setSchema] = useState<string | undefined>();
@@ -58,7 +63,7 @@ function CatalogSchemaTableSelector({
     data: catalogsData,
     isLoading: catalogsLoading,
     error: catalogsError,
-  } = useCatalogs();
+  } = useCatalogs(warehouseId);
   const {
     data: schemasData,
     isLoading: schemasLoading,
@@ -66,7 +71,7 @@ function CatalogSchemaTableSelector({
   const {
     data: tablesData,
     isLoading: tablesLoading,
-  } = useTables(catalog, schema);
+  } = useTables(catalog, schema, warehouseId);
 
   const handleCatalogChange = (value: string) => {
     setCatalog(value);
@@ -524,6 +529,8 @@ function TableDetails({ fullName }: { fullName: string }) {
 function ExplorePage() {
   const [selectedTable, setSelectedTable] = useState<string | undefined>();
   const [isGenerating, setIsGenerating] = useState(false);
+  const { data: settings, isLoading: settingsLoading } = useGetSettings(selector());
+  const checksTableName = getOptionalChecksTableName(settings);
 
   const handleGenerate = async (userInput: string) => {
     setIsGenerating(true);
@@ -539,12 +546,34 @@ function ExplorePage() {
     }
   };
 
+  const handleProfileSuggest = async () => {
+    if (!selectedTable) {
+      throw new Error("Select a table before generating profile-based suggestions.");
+    }
+
+    setIsGenerating(true);
+    try {
+      const response = await axios.post<{ yaml_output: string; checks: any[] }>(
+        "/api/profile-ai-generate-checks",
+        { table_name: selectedTable },
+        { withCredentials: true },
+      );
+      return response.data;
+    } finally {
+      setIsGenerating(false);
+    }
+  };
+
   const handleConfirmSave = async (checks: any[]) => {
+    if (settingsLoading || !checksTableName) {
+      throw new Error("Set a default rule table in Settings before saving generated checks.");
+    }
+
     await axios.post(
       "/api/checks-table/append",
       {
         checks,
-        table_name: "shao_sandbox1.dqx.checks",
+        table_name: checksTableName,
         run_config_name: selectedTable ?? null,
         mode: "upsert",
       },
@@ -567,7 +596,10 @@ function ExplorePage() {
       </div>
 
       <FadeIn>
-        <CatalogSchemaTableSelector onLoad={setSelectedTable} />
+        <CatalogSchemaTableSelector
+          onLoad={setSelectedTable}
+          warehouseId={settings?.default_warehouse_id ?? undefined}
+        />
       </FadeIn>
 
       {selectedTable && (
@@ -603,7 +635,9 @@ function ExplorePage() {
           <CardContent>
             <AICheckGenerator
               onGenerate={handleGenerate}
-              onConfirmSave={handleConfirmSave}
+              onSuggestWholeTable={selectedTable ? handleProfileSuggest : undefined}
+              onConfirmSave={!settingsLoading && checksTableName ? handleConfirmSave : undefined}
+              saveTargetLabel={!settingsLoading ? checksTableName : undefined}
               isGenerating={isGenerating}
             />
           </CardContent>

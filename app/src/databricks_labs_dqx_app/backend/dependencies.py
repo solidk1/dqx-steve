@@ -1,4 +1,5 @@
 import os
+from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Annotated
 
@@ -11,6 +12,44 @@ from fastapi import Depends, Header, HTTPException, status
 from pyspark.sql import SparkSession
 
 from .logger import logger
+from .settings import SettingsManager
+
+
+def _is_session_changed_error(error: Exception) -> bool:
+    message = str(error)
+    return "INVALID_HANDLE.SESSION_CHANGED" in message or (
+        "Spark server driver instance has restarted" in message and "invalid" in message.lower()
+    )
+
+
+def _ensure_live_spark_session(
+    spark: SparkSession, session_label: str, create_session: Callable[[], SparkSession]
+) -> SparkSession:
+    try:
+        spark.sql("SELECT 1").collect()
+        return spark
+    except Exception as e:
+        if not _is_session_changed_error(e):
+            raise
+
+        logger.warning(f"Detected stale {session_label} Spark session, reconnecting", exc_info=True)
+        try:
+            spark.stop()
+        except Exception:
+            logger.warning(f"Failed to stop stale {session_label} Spark session before reconnect", exc_info=True)
+
+        refreshed_spark = create_session()
+        refreshed_spark.sql("SELECT 1").collect()
+        return refreshed_spark
+
+
+def _get_default_compute_settings() -> tuple[bool, str | None]:
+    try:
+        settings = SettingsManager(get_app_ws()).get_settings()
+        return settings.use_serverless, settings.default_cluster_id
+    except Exception:
+        logger.warning("Failed to load app compute settings, falling back to serverless", exc_info=True)
+        return True, None
 
 
 def get_app_ws() -> WorkspaceClient:
@@ -122,20 +161,28 @@ def get_spark(
 
     # Get Databricks host from environment
     host = os.environ.get("DATABRICKS_HOST")
-    if not host:
-        logger.info("DATABRICKS_HOST not set, using default configuration for local development")
-        return DatabricksSession.builder.token(token).getOrCreate()
+    use_serverless, default_cluster_id = _get_default_compute_settings()
 
-    # Temporarily remove OAuth env vars to avoid multi-auth conflicts
-    with _without_oauth_env_vars():
-        logger.info(f"Creating Spark session with OBO token on serverless compute for host: {host}")
-        session = (
-            DatabricksSession.builder.host(host)
-            .token(token)  # Use the forwarded OBO access token
-            .serverless()
-            .getOrCreate()
-        )
-    return session
+    def create_session() -> SparkSession:
+        if not host:
+            logger.info("DATABRICKS_HOST not set, using default configuration for local development")
+            builder = DatabricksSession.builder.token(token)
+            if not use_serverless and default_cluster_id:
+                logger.info(f"Creating local Spark session with classic cluster {default_cluster_id}")
+                return builder.clusterId(default_cluster_id).getOrCreate()
+            return builder.getOrCreate()
+
+        # Temporarily remove OAuth env vars to avoid multi-auth conflicts
+        with _without_oauth_env_vars():
+            builder = DatabricksSession.builder.host(host).token(token)  # Use the forwarded OBO access token
+            if not use_serverless and default_cluster_id:
+                logger.info(f"Creating Spark session with OBO token on classic cluster {default_cluster_id} for host: {host}")
+                return builder.clusterId(default_cluster_id).getOrCreate()
+
+            logger.info(f"Creating Spark session with OBO token on serverless compute for host: {host}")
+            return builder.serverless().getOrCreate()
+
+    return _ensure_live_spark_session(create_session(), "OBO", create_session)
 
 
 def get_app_spark() -> SparkSession:
@@ -148,22 +195,36 @@ def get_app_spark() -> SparkSession:
     permissions are not strictly required (e.g., reading app-managed tables).
     """
     host = os.environ.get("DATABRICKS_HOST")
-    if not host:
-        logger.info("DATABRICKS_HOST not set, using default configuration for local development")
-        return DatabricksSession.builder.getOrCreate()
+    use_serverless, default_cluster_id = _get_default_compute_settings()
 
-    client_id = os.environ.get("DATABRICKS_CLIENT_ID")
-    client_secret = os.environ.get("DATABRICKS_CLIENT_SECRET")
-    if not client_id or not client_secret:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="App service principal credentials are not configured.",
-        )
+    def create_session() -> SparkSession:
+        if not host:
+            logger.info("DATABRICKS_HOST not set, using default configuration for local development")
+            builder = DatabricksSession.builder
+            if not use_serverless and default_cluster_id:
+                logger.info(f"Creating local app Spark session with classic cluster {default_cluster_id}")
+                return builder.clusterId(default_cluster_id).getOrCreate()
+            return builder.getOrCreate()
 
-    logger.info(f"Creating Spark session with app service principal on serverless compute for host: {host}")
-    # In Databricks Apps runtime, host/client credentials are already provided via env vars.
-    # Let Spark Connect read them from the environment to avoid sdkConfig conflicts.
-    return DatabricksSession.builder.serverless().getOrCreate()
+        client_id = os.environ.get("DATABRICKS_CLIENT_ID")
+        client_secret = os.environ.get("DATABRICKS_CLIENT_SECRET")
+        if not client_id or not client_secret:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="App service principal credentials are not configured.",
+            )
+
+        builder = DatabricksSession.builder
+        if not use_serverless and default_cluster_id:
+            logger.info(f"Creating app Spark session on classic cluster {default_cluster_id} for host: {host}")
+            return builder.clusterId(default_cluster_id).getOrCreate()
+
+        logger.info(f"Creating Spark session with app service principal on serverless compute for host: {host}")
+        # In Databricks Apps runtime, host/client credentials are already provided via env vars.
+        # Let Spark Connect read them from the environment to avoid sdkConfig conflicts.
+        return builder.serverless().getOrCreate()
+
+    return _ensure_live_spark_session(create_session(), "app", create_session)
 
 
 def get_engine(
@@ -195,6 +256,21 @@ def get_engine(
     return DQEngine(workspace_client=obo_ws, spark=spark)
 
 
+def _get_llm_model_config() -> LLMModelConfig:
+    host = os.environ.get("DATABRICKS_HOST", "").rstrip("/")
+    if not host:
+        logger.info("DATABRICKS_HOST not set, using default configuration for LLM")
+
+    serving_endpoint_name = os.environ.get("SERVING_ENDPOINT_NAME", "").strip()
+    if serving_endpoint_name:
+        return LLMModelConfig(
+            model_name=f"databricks/{serving_endpoint_name}",
+            api_base=f"{host}/serving-endpoints" if host else "",
+        )
+
+    return LLMModelConfig()
+
+
 def get_generator(
     app_ws: Annotated[WorkspaceClient, Depends(get_app_ws)],
     spark: Annotated[SparkSession, Depends(get_app_spark)],
@@ -221,11 +297,4 @@ def get_generator(
             checks = generator.generate_dq_rules_ai_assisted(user_input=user_input)
             return {"checks": checks}
     """
-    host = os.environ.get("DATABRICKS_HOST", "")
-    if host:  # DBX App
-        llm_model_config = LLMModelConfig()
-    else:  # Local development
-        logger.info("DATABRICKS_HOST not set, using default configuration for LLM")
-        llm_model_config = LLMModelConfig()
-
-    return DQGenerator(workspace_client=app_ws, spark=spark, llm_model_config=llm_model_config)
+    return DQGenerator(workspace_client=app_ws, spark=spark, llm_model_config=_get_llm_model_config())

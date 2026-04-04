@@ -237,7 +237,7 @@ def test_profiler_config_custom_values():
 # Test LLMModelConfig
 def test_llm_model_config_defaults():
     config = LLMModelConfig()
-    assert config.model_name == "databricks/databricks-claude-sonnet-4-5"
+    assert config.model_name == "databricks/databricks-claude-sonnet-4-6"
     assert config.api_key == ""
     assert config.api_base == ""
 
@@ -255,7 +255,7 @@ def test_llm_model_config_custom_values():
 def test_llm_config_defaults():
     config = LLMConfig()
     assert isinstance(config.model, LLMModelConfig)
-    assert config.model.model_name == "databricks/databricks-claude-sonnet-4-5"
+    assert config.model.model_name == "databricks/databricks-claude-sonnet-4-6"
 
 
 def test_llm_config_with_custom_model():

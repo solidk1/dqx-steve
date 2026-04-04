@@ -15,7 +15,24 @@ if ! databricks apps get "$APP_NAME" -t "$TARGET" &>/dev/null; then
   databricks apps create --name "$APP_NAME" --description "Databricks DQX App" -t "$TARGET" --no-wait
 fi
 
-# 3. Deploy latest code to the app
+# 3. Ensure the app requests the valid OBO scopes supported by Databricks Apps.
+echo "==> Updating app user API scopes..."
+databricks apps update "$APP_NAME" -t "$TARGET" --json '{
+  "description": "DQX Builder App",
+  "user_api_scopes": [
+    "sql",
+    "files.files",
+    "catalog.catalogs:read",
+    "catalog.schemas:read",
+    "catalog.tables:read",
+    "catalog.connections",
+    "dashboards.genie",
+    "sql.warehouses",
+    "sql.statement-execution"
+  ]
+}'
+
+# 4. Deploy latest code to the app
 echo "==> Deploying app..."
 databricks apps deploy "$APP_NAME" --source-code-path "$SOURCE_CODE_PATH" -t "$TARGET"
 

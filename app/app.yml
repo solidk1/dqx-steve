@@ -4,3 +4,6 @@ command:
     "-lc",
     "./.venv/bin/pip install --force-reinstall --no-deps /app/python/source_code/*.whl && uvicorn databricks_labs_dqx_app.backend.app:app --workers 2",
   ]
+env:
+  - name: SERVING_ENDPOINT_NAME
+    valueFrom: serving-endpoint

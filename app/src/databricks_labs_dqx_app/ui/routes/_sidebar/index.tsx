@@ -5,6 +5,12 @@ import { useQuery } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
 import axios from "axios";
 import { toast } from "sonner";
+import { useGetSettings } from "@/lib/api";
+import selector from "@/lib/selector";
+import {
+  DEFAULT_CHECKS_TABLE_REQUIRED_MESSAGE,
+  getRequiredChecksTableName,
+} from "@/lib/checks-table";
 import {
   Select,
   SelectContent,
@@ -35,12 +41,18 @@ interface SelectedRule {
   checkName: string;
 }
 
-function useChecksTable() {
+function useChecksTable(tableName: string | null) {
   return useQuery<ChecksTableOut>({
-    queryKey: ["/api/checks-table"],
+    queryKey: ["/api/checks-table", tableName],
+    enabled: !!tableName,
     queryFn: ({ signal }) =>
       axios
-        .get<ChecksTableOut>("/api/checks-table", { signal })
+        .get<ChecksTableOut>("/api/checks-table", {
+          signal,
+          params: {
+            table_name: tableName,
+          },
+        })
         .then((r) => r.data),
   });
 }
@@ -79,7 +91,28 @@ export const Route = createFileRoute("/_sidebar/")({
 });
 
 function Index() {
-  const { data, isLoading, isError, error, refetch } = useChecksTable();
+  const {
+    data: settings,
+    isLoading: settingsLoading,
+    isError: settingsIsError,
+    error: settingsError,
+  } = useGetSettings(selector());
+  const checksTableName = useMemo(() => {
+    if (!settings) {
+      return null;
+    }
+    try {
+      return getRequiredChecksTableName(settings);
+    } catch {
+      return null;
+    }
+  }, [settings]);
+  const checksTableConfigError =
+    settings && !checksTableName
+      ? new Error(DEFAULT_CHECKS_TABLE_REQUIRED_MESSAGE)
+      : null;
+  const { data, isLoading, isError, error, refetch } =
+    useChecksTable(checksTableName);
   const { data: dashboardData } = useDashboard();
   const [runConfigFilter, setRunConfigFilter] = useState<string>("all");
   const [isRunningChecks, setIsRunningChecks] = useState(false);
@@ -92,11 +125,29 @@ function Index() {
     isError: selectedErrorRowsError,
     error: selectedErrorRowsErrorDetail,
   } = useCheckErrorRows(selectedRule);
+  const shouldShowSelectedErrorRows = useMemo(() => {
+    if (!selectedRule) return false;
+    if (selectedErrorRowsLoading || selectedErrorRowsError || !selectedErrorRows) return true;
+    return selectedErrorRows.rows.length > 0 || selectedErrorRows.columns.length > 0;
+  }, [
+    selectedRule,
+    selectedErrorRows,
+    selectedErrorRowsError,
+    selectedErrorRowsLoading,
+  ]);
 
   const handleRunChecksNow = async () => {
+    if (!checksTableName) {
+      toast.error(DEFAULT_CHECKS_TABLE_REQUIRED_MESSAGE);
+      return;
+    }
     setIsRunningChecks(true);
     try {
-      const response = await axios.post("/api/checks-table/run-job");
+      const response = await axios.post("/api/checks-table/run-job", undefined, {
+        params: {
+          table_name: checksTableName,
+        },
+      });
       const jobUrl = response?.data?.job_url;
       const runUrl = response?.data?.run_url;
       toast.success("DQX check job triggered", {
@@ -173,7 +224,10 @@ function Index() {
             <div>
               <h2 className="text-2xl font-bold">Data Quality Rules</h2>
               <p className="text-sm text-muted-foreground mt-1">
-                Rules from <code className="bg-muted px-1.5 py-0.5 rounded text-xs">shao_sandbox1.dqx.checks</code>
+                Rules from{" "}
+                <code className="bg-muted px-1.5 py-0.5 rounded text-xs">
+                  {checksTableName ?? "not configured"}
+                </code>
               </p>
             </div>
             <div className="flex items-center gap-2">
@@ -181,7 +235,7 @@ function Index() {
                 variant="outline"
                 size="sm"
                 onClick={() => refetch()}
-                disabled={isLoading}
+                disabled={isLoading || !checksTableName}
               >
                 <RefreshCw className={`h-4 w-4 mr-2 ${isLoading ? "animate-spin" : ""}`} />
                 Refresh
@@ -220,33 +274,40 @@ function Index() {
             </div>
           )}
 
-          {isLoading && (
+          {(settingsLoading || isLoading) && (
             <div className="flex items-center justify-center py-16 text-muted-foreground">
               <Loader2 className="h-6 w-6 animate-spin mr-3" />
               Loading rules...
             </div>
           )}
 
-          {isError && (
+          {(settingsIsError || checksTableConfigError || isError) && (
             <div className="flex items-center gap-3 p-4 rounded-lg bg-destructive/10 text-destructive border border-destructive/20">
               <AlertCircle className="h-5 w-5 shrink-0" />
-              <p className="text-sm">Failed to load rules: {(error as any)?.response?.data?.detail || error?.message}</p>
+              <p className="text-sm">
+                Failed to load rules:{" "}
+                {(settingsError as any)?.response?.data?.detail ||
+                  settingsError?.message ||
+                  checksTableConfigError?.message ||
+                  (error as any)?.response?.data?.detail ||
+                  error?.message}
+              </p>
             </div>
           )}
 
-          {data && data.rows.length === 0 && (
+          {checksTableName && data && data.rows.length === 0 && (
             <div className="text-center py-16 text-muted-foreground">
               No rules found in the checks table.
             </div>
           )}
 
-          {data && data.rows.length > 0 && filteredRows.length === 0 && (
+          {checksTableName && data && data.rows.length > 0 && filteredRows.length === 0 && (
             <div className="text-center py-16 text-muted-foreground">
               No rules found for selected table filter.
             </div>
           )}
 
-          {data && data.rows.length > 0 && filteredRows.length > 0 && (
+          {checksTableName && data && data.rows.length > 0 && filteredRows.length > 0 && (
             <div className="rounded-lg border overflow-hidden max-w-full min-w-0">
               <div className="overflow-x-auto max-w-full">
                 <table className="w-full text-sm min-w-[1000px] table-fixed">
@@ -335,7 +396,7 @@ function Index() {
             </div>
           )}
 
-          {selectedRule && (
+          {shouldShowSelectedErrorRows && selectedRule && (
             <div className="mt-6 space-y-3 min-w-0">
               <div className="flex items-start justify-between gap-3">
                 <div>

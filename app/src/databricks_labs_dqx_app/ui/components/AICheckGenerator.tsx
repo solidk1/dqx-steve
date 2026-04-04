@@ -2,17 +2,25 @@ import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { Card } from "@/components/ui/card";
-import { Loader2, ArrowRight, Copy, Sparkles, Check } from "lucide-react";
+import { Loader2, ArrowRight, Copy, Sparkles, Check, Database } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { toast } from "sonner";
 
 interface AICheckGeneratorProps {
   onGenerate: (userInput: string) => Promise<{ yaml_output: string; checks: any[] }>;
+  onSuggestWholeTable?: () => Promise<{ yaml_output: string; checks: any[] }>;
   onConfirmSave?: (checks: any[]) => Promise<void>;
+  saveTargetLabel?: string;
   isGenerating: boolean;
 }
 
-export function AICheckGenerator({ onGenerate, onConfirmSave, isGenerating }: AICheckGeneratorProps) {
+export function AICheckGenerator({
+  onGenerate,
+  onSuggestWholeTable,
+  onConfirmSave,
+  saveTargetLabel,
+  isGenerating,
+}: AICheckGeneratorProps) {
   const [userInput, setUserInput] = useState("");
   const [generatedYaml, setGeneratedYaml] = useState<string | null>(null);
   const [generatedChecks, setGeneratedChecks] = useState<any[] | null>(null);
@@ -40,10 +48,32 @@ export function AICheckGenerator({ onGenerate, onConfirmSave, isGenerating }: AI
     }
   };
 
+  const handleSuggestWholeTable = async () => {
+    if (!onSuggestWholeTable) return;
+
+    try {
+      const result = await onSuggestWholeTable();
+      setGeneratedYaml(result.yaml_output);
+      setGeneratedChecks(result.checks);
+      toast.success("Profile-based checks generated successfully!");
+    } catch (error) {
+      console.error("Failed to generate profile-based checks:", error);
+      const detail =
+        (error as any)?.response?.data?.detail ||
+        (error as Error)?.message ||
+        "Please try again.";
+      toast.error(`Failed to generate profile-based checks: ${detail}`);
+    }
+  };
+
   const handleConfirmSave = async () => {
     if (!onConfirmSave || !generatedChecks || generatedChecks.length === 0) return;
 
-    const confirmed = window.confirm("Save generated checks to shao_sandbox1.dqx.checks?");
+    const confirmed = window.confirm(
+      saveTargetLabel
+        ? `Save generated checks to ${saveTargetLabel}?`
+        : "Save generated checks?",
+    );
     if (!confirmed) return;
 
     try {
@@ -91,6 +121,29 @@ export function AICheckGenerator({ onGenerate, onConfirmSave, isGenerating }: AI
           </p>
         </div>
       </div>
+
+      {onSuggestWholeTable && (
+        <div className="mb-4">
+          <Button
+            onClick={handleSuggestWholeTable}
+            disabled={isGenerating || isSaving}
+            variant="secondary"
+            className="gap-2"
+          >
+            {isGenerating ? (
+              <>
+                <Loader2 className="h-4 w-4 animate-spin" />
+                Profiling Table...
+              </>
+            ) : (
+              <>
+                <Database className="h-4 w-4" />
+                Profile Table + Suggest Rules
+              </>
+            )}
+          </Button>
+        </div>
+      )}
 
       {/* Generated YAML Output */}
       <div className="flex-1 mb-4 overflow-hidden">

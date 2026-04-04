@@ -32,6 +32,12 @@ class ChecksIn(BaseModel):
 
 class InstallationSettings(BaseModel):
     install_folder: str = Field(description="Path to the folder containing config.yml")
+    default_catalog: str | None = Field(default=None, description="Default Unity Catalog name")
+    default_schema: str | None = Field(default=None, description="Default schema name")
+    default_checks_table: str | None = Field(default=None, description="Fully qualified checks table name (catalog.schema.table)")
+    use_serverless: bool = Field(default=True, description="Use serverless compute by default")
+    default_cluster_id: str | None = Field(default=None, description="Default classic cluster ID for Spark execution")
+    default_warehouse_id: str | None = Field(default=None, description="Default SQL warehouse ID")
 
 
 class GenerateChecksIn(BaseModel):
@@ -47,12 +53,17 @@ class GenerateChecksOut(BaseModel):
     checks: list[dict[str, Any]] = Field(description="Generated checks as a list of dictionaries")
 
 
+class ProfileGenerateChecksIn(BaseModel):
+    table_name: str = Field(description="Fully qualified table name (catalog.schema.table) to profile")
+    user_input: str | None = Field(
+        default=None,
+        description="Optional additional natural language requirements to combine with profile-based suggestions",
+    )
+
+
 class SaveGeneratedChecksIn(BaseModel):
     checks: list[dict[str, Any]] = Field(description="Generated checks to append to the checks table")
-    table_name: str = Field(
-        default="shao_sandbox1.dqx.checks",
-        description="Fully qualified checks table name",
-    )
+    table_name: str = Field(description="Fully qualified checks table name")
     run_config_name: str | None = Field(
         default=None,
         description="Optional run config name to store with generated checks",
@@ -65,6 +76,31 @@ class SaveGeneratedChecksIn(BaseModel):
 
 class SaveGeneratedChecksOut(BaseModel):
     inserted: int = Field(description="Number of checks inserted")
+
+
+class WarehouseInfo(BaseModel):
+    id: str = Field(description="SQL warehouse ID")
+    name: str = Field(description="SQL warehouse name")
+    state: str | None = Field(default=None, description="Warehouse state (RUNNING, STOPPED, etc.)")
+
+
+class WarehousesOut(BaseModel):
+    warehouses: list[WarehouseInfo]
+
+
+class ClusterInfo(BaseModel):
+    id: str = Field(description="Classic cluster ID")
+    name: str = Field(description="Classic cluster name")
+    state: str | None = Field(default=None, description="Cluster state (RUNNING, TERMINATED, etc.)")
+
+
+class ClustersOut(BaseModel):
+    clusters: list[ClusterInfo]
+
+
+class CreateChecksTableOut(BaseModel):
+    table_name: str = Field(description="Fully qualified table name that was created")
+    created: bool = Field(description="True if table was newly created, False if it already existed")
 
 
 class CatalogsOut(BaseModel):
